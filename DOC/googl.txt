@@ -1,0 +1,122 @@
+Мой вопрос:
+Для Windows 10, есть ли библиотеки WinAPI, позволяющие перемещать, приложения и их окна с одного дестопа на другой?
+
+Ответ Google:
+Да, в Windows 10 для перемещения окон между виртуальными рабочими столами используется COM-интерфейс IVirtualDesktopManager, объявленный в заголовочном файле shobjidl_core.h. Однако у официального API есть строгое ограничение: оно позволяет перемещать только окна, принадлежащие вашему собственному процессу. [1] (https://learn.microsoft.com/ru-ru/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager), [2] (https://stackoverflow.com/questions/32659505/windows-10-ivirtualdesktopmanagermovewindowtodesktop)
+В зависимости от того, чьими окнами вы хотите управлять, подход будет различаться.
+
+1. Официальный WinAPI (только для окон вашего приложения)
+
+Для работы с собственными окнами используйте системный COM-объект CLSID_VirtualDesktopManager. В интерфейсе IVirtualDesktopManager доступны три метода: [1] (https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager), [2] (https://learn.microsoft.com/ru-ru/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager)
+• MoveWindowToDesktop. Принимает дескриптор окна верхнего уровня (HWND) и идентификатор целевого рабочего стола (GUID). Переносит указанное окно на нужный стол.
+• GetWindowDesktopId. Возвращает GUID виртуального рабочего стола, на котором сейчас находится переданное окно.
+• IsWindowOnCurrentVirtualDesktop. Проверяет, расположено ли окно на активном в данный момент рабочем столе. [1] (https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ivirtualdesktopmanager-movewindowtodesktop), [2] (https://learn.microsoft.com/ru-ru/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager), [3] (https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager)
+Ограничение: если передать в MoveWindowToDesktop чужой HWND (например, окно Блокнота или браузера), метод вернет ошибку доступа (E_ACCESSDENIED). Кроме того, официальный интерфейс не позволяет получить список всех доступных рабочих столов или переключаться между ними.
+
+2. Недокументированный COM API (для чужих окон и полного контроля)
+
+Если ваша задача — написать утилиту для управления окнами сторонних программ, вам потребуются внутренние (недокументированные) интерфейсы оболочки Windows (ImmersiveShell): [1] (https://stackoverflow.com/questions/32659505/windows-10-ivirtualdesktopmanagermovewindowtodesktop)
+• IApplicationViewCollection. Метод GetViewForHwnd позволяет получить внутреннее представление окна (IApplicationView) по его обычному HWND.
+• IVirtualDesktopManagerInternal. Предоставляет метод MoveViewToDesktop, который перемещает любые окна (включая чужие) на выбранный рабочий стол. Также этот интерфейс позволяет получать список всех столов (GetDesktops), создавать новые (CreateDesktop) и переключаться между ними (SwitchDesktop). [1] (https://github.com/nullpo-head/Windows-10-Virtual-Desktop-Switching-Shortcut/blob/master/VirtualDesktopSwitcher/VirtualDesktopSwitcher/VirtualDesktops.h), [2] (https://stackoverflow.com/questions/32659505/windows-10-ivirtualdesktopmanagermovewindowtodesktop)
+Важный нюанс: Microsoft не документирует эти интерфейсы. Их идентификаторы (IID / GUID) и сигнатуры методов меняются почти в каждом крупном обновлении Windows 10 (например, в сборках 1809, 1903, 2004 и 21H2 используются разные GUID). [1] (https://www.powershellgallery.com/packages/VirtualDesktop/1.0.1/Content/VirtualDesktop.ps1)
+
+Готовые open-source библиотеки и обертки
+
+Чтобы не писать обвязку вокруг COM и не отслеживать изменения GUID для разных билдов Windows 10 вручную, можно использовать готовые решения:
+• VirtualDesktop (C# / .NET). Популярная библиотека, которая инкапсулирует работу с внутренними интерфейсами и поддерживает разные сборки Windows 10.
+• MScholtes / VirtualDesktop (C# / PowerShell). Набор утилит и исходный код с актуальными GUID для разных версий ОС.
+• VirtualDesktopAccessor (C++). Нативная DLL-библиотека, предоставляющая простой C-интерфейс (функции вроде MoveWindowToDesktopNumber) поверх сложных COM-вызовов. [1] (https://www.nuget.org/packages/VirtualDesktop), [2] (https://github.com/MScholtes/VirtualDesktop/blob/master/VirtualDesktop.cs), [3] (https://stackoverflow.com/questions/32659505/windows-10-ivirtualdesktopmanagermovewindowtodesktop)
+Если подскажете, на каком языке программирования вы пишете и нужно ли перемещать чужие окна или только свои, я смогу привести готовый пример кода.
+
+Мой следующий вопрос:
+C++, Пишу утилиту, поэтому надо перемещать любые окна.
+
+Следующий ответ Google:
+Для перемещения чужих окон на C++ потребуется подключиться к недокументированным внутренним COM-интерфейсам ImmersiveShell. Они позволяют получить внутренний объект представления окна по его HWND и перенести его на любой рабочий стол.
+
+Логика работы через внутренний COM API
+
+Для выполнения задачи нужно пройти 4 шага:
+• Инициализировать COM и получить ServiceProvider. Вызовите CoInitialize(nullptr) и создайте экземпляр системного сервиса CLSID_ImmersiveShell через CoCreateInstance, запросив интерфейс IServiceProvider.
+• Запросить внутренние интерфейсы. Через метод QueryService у полученного IServiceProvider запросите два интерфейса: IApplicationViewCollection и IVirtualDesktopManagerInternal.
+• Получить IApplicationView по HWND. Вызовите метод GetViewForHwnd(hwnd, &pView) у IApplicationViewCollection. Это обойдет ограничение безопасности официального API, так как внутренний менеджер работает именно с IApplicationView, а не с HWND.
+• Найти целевой стол и переместить окно. Получите список столов через GetDesktops(&pObjectArray) у IVirtualDesktopManagerInternal, извлеките нужный IVirtualDesktop по индексу и вызовите MoveViewToDesktop(pView, pDesktop).
+
+Особенности и подводные камни
+
+При реализации на C++ важно учитывать три технических нюанса:
+• Изменение GUID между сборками. Идентификаторы (IID) интерфейса IVirtualDesktopManagerInternal и таблица его виртуальных методов (vtable) меняются в зависимости от номера сборки Windows 10 (например, 1809, 1903, 2004, 21H2). В коде придется проверять версию ОС и подставлять соответствующий IID и структуру интерфейса.
+• Права доступа (UIPI). Если вы пытаетесь переместить окно программы, запущенной от имени администратора (например, Диспетчера задач), ваша утилита также должна быть запущена с правами администратора. В противном случае вызов завершится ошибкой доступа.
+• Окна верхнего уровня. Передавать в GetViewForHwnd нужно только дескриптор главного (top-level) окна приложения. Дочерние окна и диалоги перемещать отдельно нельзя.
+
+Готовые решения для интеграции в C++
+
+Чтобы не тратить время на реверс-инжиниринг таблиц виртуальных методов под каждый билд Windows 10, можно использовать готовый код:
+• VirtualDesktopAccessor (C++ / Rust). Это самый популярный проект для нативной работы с рабочими столами. Вы можете либо скомпилировать его как DLL и вызывать готовые C-функции (например, MoveWindowToDesktopNumber(HWND, int)), либо скопировать определения интерфейсов и GUID прямо в свой проект.
+• Поиске на GitHub по запросу IVirtualDesktopManagerInternal C++. Позволит найти актуальные заголовочные файлы с уже прописанными структурами vtable для конкретных версий Windows 10.
+Нужен ли вам пример C++ кода с объявлением COM-интерфейсов для конкретной сборки Windows 10 (например, 21H2 / 22H2), или лучше показать, как подключить готовую библиотеку VirtualDesktopAccessor?
+
+Мой последний вопрос:
+VirtualDesktopAccessor - Это библиотека со скрытым исходным кодом? 
+У меня Windows 10 (22H2)
+
+Ответ Google:
+Нет, VirtualDesktopAccessor — это проект с полностью открытым исходным кодом под лицензией MIT, размещенный на GitHub. Вы можете свободно изучить его реализацию, скомпилировать под себя или взять готовые структуры и GUID в свой C++ проект. [1] (https://github.com/ciantic/virtualdesktopAccessor)
+
+Что важно знать про поддержку Windows 10 (22H2)
+
+• Финальный релиз для Windows 10. Автор проекта развивает основную ветку для актуальных сборок Windows 11, но в разделе Releases доступна финальная версия специально для Windows 10. Она полностью совместима со сборкой 22H2 (билд 19045), так как внутренние COM-интерфейсы Windows 10 в последних обновлениях больше не менялись. [1] (https://github.com/ciantic/virtualdesktopAccessor), [2] (https://github.com/Ciantic/VirtualDesktopAccessor/releases)
+• Язык реализации. Изначально библиотека была написана на C++, а позже автор переписал её на Rust (с экспортом стандартного C ABI). В истории коммитов репозитория или в старых ветках можно найти оригинальный C++ код, либо просто забрать актуальные GUID из Rust-кода (winvd), так как имена интерфейсов и порядок методов в vtable там идентичны.
+
+Определения интерфейсов для Windows 10 (22H2 / билд 19045)
+
+Если вы не хотите тащить в проект стороннюю DLL, вот актуальные GUID и сигнатуры COM-интерфейсов для вашей версии ОС, которые можно вставить напрямую в C++ код:
+cpp
+#include <windows.h>
+#include <objbase.h>
+#include <ObjectArray.h>
+
+// Системные CLSID и IID для Windows 10 (сборки 1809 - 22H2)
+const CLSID CLSID_ImmersiveShell = { 0xC2F03A33, 0x21F5, 0x47FA, { 0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39 } };
+const CLSID CLSID_VirtualDesktopManagerInternal = { 0xC5E0CDCA, 0x7B6E, 0x41B2, { 0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B } };
+
+const IID IID_IApplicationView = { 0x372E1D3B, 0x38D3, 0x42E4, { 0xA1, 0x5B, 0x8A, 0xB2, 0xB1, 0x78, 0xF5, 0x13 } };
+const IID IID_IApplicationViewCollection = { 0x1841C6D7, 0x4F9D, 0x42C0, { 0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5 } };
+const IID IID_IVirtualDesktop = { 0xFF72FFDD, 0xBE7E, 0x43FC, { 0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4 } };
+const IID IID_IVirtualDesktopManagerInternal = { 0xF31574D6, 0xB682, 0x4CDC, { 0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6 } };
+
+// Минимальные объявления интерфейсов с сохранением порядка методов в vtable
+struct IApplicationView : public IUnknown { /* методы можно опустить, нам нужен только указатель */ };
+
+struct IVirtualDesktop : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IApplicationView* pView, int* pfVisible) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetID(GUID* pGuid) = 0;
+};
+
+struct IApplicationViewCollection : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetViews(IObjectArray** array) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByZOrder(IObjectArray** array) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByAppUserModelId(PCWSTR id, IObjectArray** array) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND hwnd, IApplicationView** view) = 0;
+    // Остальные методы ниже по таблице можно не объявлять, если вы их не вызываете
+};
+
+struct IVirtualDesktopManagerInternal : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetCount(UINT* pCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop(IApplicationView* pView, IVirtualDesktop* pDesktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(IApplicationView* pView, int* pfCanViewMoveDesktops) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(IVirtualDesktop** desktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray** ppDesktops) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop(IVirtualDesktop* pDesktopReference, int uDirection, IVirtualDesktop** ppAdjacentDesktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchDesktop(IVirtualDesktop* pDesktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateDesktopW(IVirtualDesktop** ppNewDesktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RemoveDesktop(IVirtualDesktop* pRemove, IVirtualDesktop* pFallbackDesktop) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindDesktop(GUID* desktopId, IVirtualDesktop** ppDesktop) = 0;
+};
+Используйте код с осторожностью.
+
+Важное правило при работе с vtable
+
+Обратите внимание на структуру IApplicationViewCollection и IVirtualDesktopManagerInternal выше:
+• Порядок методов критичен. В C++ компилятор строит таблицу виртуальных функций (vtable) строго сверху вниз. Вы можете не объявлять методы, которые идут после нужного вам, но все методы, идущие до него, должны присутствовать в правильном порядке и с точным количеством аргументов (даже как функции-заглушки).
+Показать полный пример функции на C++, которая по HWND и номеру рабочего стола (например, 0 или 1) инициализирует эти интерфейсы и переносит окно?
