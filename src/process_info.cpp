@@ -81,6 +81,13 @@ std::map<DWORD, sm::ProcessInfo>& Cache() {
     return cache;
 }
 
+// Права процессов кэшируются отдельно от ProcessInfo: save спрашивает их у каждого
+// окна-кандидата, а окон у одного приложения бывает несколько.
+std::map<DWORD, int>& ElevationCache() {
+    static std::map<DWORD, int> cache;
+    return cache;
+}
+
 }  // namespace
 
 namespace sm {
@@ -140,6 +147,40 @@ const ProcessInfo& ProcessInfoFor(DWORD pid) {
 
 void ClearProcessCache() {
     Cache().clear();
+    ElevationCache().clear();
+}
+
+int ProcessElevation(DWORD pid) {
+    if (pid == 0) {
+        return -1;
+    }
+    auto& cache = ElevationCache();
+    const auto found = cache.find(pid);
+    if (found != cache.end()) {
+        return found->second;
+    }
+
+    int result = -1;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process != nullptr) {
+        HANDLE token = nullptr;
+        if (OpenProcessToken(process, TOKEN_QUERY, &token) != FALSE) {
+            TOKEN_ELEVATION elevation{};
+            DWORD size = sizeof(elevation);
+            if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) !=
+                FALSE) {
+                result = elevation.TokenIsElevated != 0 ? 1 : 0;
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+    }
+    if (result < 0 && IsVerbose()) {
+        Trace(L"процесс %lu: права не прочитаны (%s)", static_cast<unsigned long>(pid),
+              Win32ErrorText(GetLastError()).c_str());
+    }
+    cache.emplace(pid, result);
+    return result;
 }
 
 std::wstring WindowAppUserModelId(HWND hwnd) {

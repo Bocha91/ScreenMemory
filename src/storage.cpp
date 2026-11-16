@@ -525,6 +525,11 @@ std::wstring SerializeLayout(const Layout& layout) {
         }
         AppendKey(&text, L"show", window.show);
         AppendInt(&text, L"uwp", window.uwp);
+        // Ключ пишется только у окон, которые были открыты от администратора (§9.3):
+        // у обычных приложений его нет, и слепок остаётся прежнего вида.
+        if (window.elevated != 0) {
+            AppendInt(&text, L"elevated", 1);
+        }
     }
 
     return text;
@@ -568,6 +573,9 @@ std::wstring WindowContentKey(const LayoutWindow& window) {
     AppendRect(&text, L"frame_rect", window.frame);
     AppendTrimmed(&text, L"show", window.show);
     AppendInt(&text, L"uwp", window.uwp);
+    // Права окна — часть содержимого: если приложение перестало (или стало) запускаться
+    // от администратора, файл должен перезаписаться, иначе restore пойдёт по старым правам.
+    AppendInt(&text, L"elevated", window.elevated != 0 ? 1 : 0);
     return text;
 }
 
@@ -843,6 +851,8 @@ bool ParseLayout(const std::wstring& text, Layout* out, std::wstring* error) {
                 window.show = value;
             } else if (key == L"uwp" && ParseInt(value, &number)) {
                 window.uwp = number != 0 ? 1 : 0;
+            } else if (key == L"elevated" && ParseInt(value, &number)) {
+                window.elevated = number != 0 ? 1 : 0;
             }
         }
     }

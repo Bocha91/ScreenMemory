@@ -38,7 +38,8 @@ namespace sm {
 enum class AdminReason {
     MoveBlocked,       // SetWindowPlacement отказал (UIPI) или молча не применился (§9.3)
     MoveDesktopFailed, // MoveWindowToDesktop не смог перенести окно
-    LaunchElevated,    // CreateProcessW → ERROR_ELEVATION_REQUIRED
+    LaunchElevated,    // требует повышения прав: в слепке `elevated=1` (окно было открыто
+                       // от администратора) либо CreateProcessW → ERROR_ELEVATION_REQUIRED
     LaunchFailed,      // процесс не запустился или окно не удалось расставить
     LaunchTimeout,     // процесс запущен, но окно не появилось
     Console,           // консоль: неизвестно, что в ней было запущено (§9.4)

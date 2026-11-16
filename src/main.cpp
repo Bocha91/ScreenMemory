@@ -457,6 +457,13 @@ sm::LayoutWindow MakeLayoutWindow(const sm::WindowInfo& info,
     window.aumid = info.aumid;
     window.show = info.placementOk ? SaveShowStateText(info.placement.showCmd) : L"normal";
     window.uwp = (info.cloaked & sm::CloakedApp) != 0 ? 1 : 0;
+    // Права окна (PLAN.md §9.3): restore поднимет это приложение с повышением, а
+    // остальные — с обычными правами. Узнать не удалось (-1) — считается обычным:
+    // попытка запуска без повышения либо сработает, либо уйдёт в admin.log.
+    window.elevated = sm::ProcessElevation(info.pid) == 1 ? 1 : 0;
+    if (window.elevated != 0) {
+        sm::Trace(L"  окно «%s» открыто от администратора", info.title.c_str());
+    }
     window.frame = info.frame;
     window.frameOk = info.frameOk;
 
@@ -795,6 +802,49 @@ std::wstring DesktopNameOrStub(const std::wstring& name) {
     return name.empty() ? std::wstring(L"(без имени)") : L"«" + name + L"»";
 }
 
+// Окна запущенных приложений «успокоились»? Часть приложений выставляет своё окно уже
+// после появления: nw.js (AudioPL) и некоторые Electron-приложения ставят окно по своему
+// сохранённому месту, и перенос в тот же момент они переигрывают — окно остаётся посреди
+// экрана. Поэтому геометрию ставим только после того, как прямоугольники всех окон
+// перестали меняться: одинаковые два опроса подряд (шаг 500 мс), но не дольше maxMs.
+void WaitRectsStable(const std::vector<HWND>& windows, int quietMs, int maxMs) {
+    if (windows.empty()) {
+        return;
+    }
+    std::vector<RECT> previous(windows.size());
+    const ULONGLONG started = GetTickCount64();
+    const ULONGLONG deadline = started + static_cast<ULONGLONG>(maxMs < 0 ? 0 : maxMs);
+    ULONGLONG stableSince = started;
+    for (;;) {
+        Sleep(500);
+        bool changed = false;
+        for (size_t i = 0; i < windows.size(); ++i) {
+            RECT now{};
+            if (IsWindow(windows[i]) == FALSE || GetWindowRect(windows[i], &now) == FALSE) {
+                continue;  // окно закрылось — его не ждём
+            }
+            if (now.left != previous[i].left || now.top != previous[i].top ||
+                now.right != previous[i].right || now.bottom != previous[i].bottom) {
+                changed = true;
+                previous[i] = now;
+            }
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (changed) {
+            stableSince = now;
+        } else if (now - stableSince >= static_cast<ULONGLONG>(quietMs < 0 ? 0 : quietMs)) {
+            sm::Trace(L"  окна запущенных приложений на месте: ждали %.1f с",
+                      static_cast<double>(now - started) / 1000.0);
+            return;
+        }
+        if (now >= deadline) {
+            sm::Trace(L"  прямоугольники окон всё ещё меняются через %.1f с — переношу как есть",
+                      static_cast<double>(now - started) / 1000.0);
+            return;
+        }
+    }
+}
+
 // Карта «десктоп из файла → десктоп сейчас» (PLAN.md §8.0 п.3). Печатается всегда:
 // если окна уехали не туда, по ней сразу видно, на каком шаге mapping ошибся.
 void PrintDesktopMap(const sm::Layout& layout, const std::vector<sm::DesktopTarget>& targets) {
@@ -930,6 +980,114 @@ int RunRestore(const CommandLine& cl) {
     std::vector<sm::LayoutMonitor> liveMonitors;
     if (!sm::CollectMonitors(&liveMonitors)) {
         sm::Warn(L"мониторы не перечислены: координаты берём из абсолютных rect записей");
+    }
+
+    // ------------------------------------------------------------------------
+    // Ранний запуск браузеров (CONTEXT п. 70, PLAN.md §8.3 п.0).
+    //
+    // Браузер при холодном старте сам восстанавливает сессию профиля («Продолжить с того
+    // же места»), но делает это не сразу: на прогоне 16.11.2026 его окна продолжали
+    // открываться спустя минуту после снимка фазы A, и фаза B открывала те же адреса
+    // второй раз. Поэтому браузер, который есть в layout.txt и ещё не запущен, поднимаем
+    // здесь — до снятия снимка, — и ждём AutoRestoreDelay секунд: за это время он
+    // восстановит свои окна, они попадут в снимок и будут расставлены по адресам.
+    // Уже запущенный браузер не трогаем: его сессия восстановлена при входе в систему.
+    if (!cl.dryRun) {
+        struct BrowserLaunch {
+            std::wstring exe;
+            std::wstring cls;
+            int records = 0;
+            bool elevated = false;  // хотя бы одна запись была открыта от администратора
+        };
+        std::vector<BrowserLaunch> browsers;
+        for (const sm::LayoutWindow& record : layout.windows) {
+            if (record.exe.empty() || !sm::IsBrowserExe(sm::FileNameOf(record.exe))) {
+                continue;
+            }
+            BrowserLaunch* browser = nullptr;
+            for (BrowserLaunch& item : browsers) {
+                if (_wcsicmp(item.exe.c_str(), record.exe.c_str()) == 0) {
+                    browser = &item;
+                    break;
+                }
+            }
+            if (browser == nullptr) {
+                browsers.push_back(BrowserLaunch{record.exe, record.cls, 0, false});
+                browser = &browsers.back();
+            }
+            if (browser->cls.empty()) {
+                browser->cls = record.cls;
+            }
+            ++browser->records;
+            if (record.elevated != 0) {
+                browser->elevated = true;
+            }
+        }
+
+        if (!browsers.empty()) {
+            // Окна, которые есть до прогрева: по этому списку потом видно, что браузер
+            // открыл уже после (пустое окно «Новая вкладка» его же и создано).
+            std::vector<HWND> knownBefore;
+            std::vector<sm::WindowInfo> before;
+            sm::WindowEnumStats beforeStats;
+            if (sm::CollectWindows(&before, &beforeStats)) {
+                knownBefore.reserve(before.size());
+                for (const sm::WindowInfo& info : before) {
+                    knownBefore.push_back(info.hwnd);
+                }
+            }
+            // Первое окно браузера ждём недолго: если его нет и через полминуты, прогрев
+            // не удался — фаза B запустит страницы обычным путём.
+            constexpr int kWarmTimeoutMs = 30000;
+            int warmed = 0;
+            for (const BrowserLaunch& browser : browsers) {
+                if (sm::IsExeRunning(browser.exe)) {
+                    sm::Trace(L"  браузер %s уже запущен — ранний запуск не нужен",
+                              sm::FileNameOf(browser.exe).c_str());
+                    continue;
+                }
+                // Прогрев — без адреса: страницы откроет фаза B, а здесь важно дать
+                // браузеру восстановить сессию и получить свои окна в снимок фазы A.
+                // Права — как у фазы B (PLAN.md §9.3): при повышенном restore обычный
+                // браузер поднимается с токеном оболочки, иначе он станет администраторским
+                // и не увидит профиль пользователя.
+                const sm::LaunchRights rights =
+                    (sm::IsElevated() && !browser.elevated) ? sm::LaunchRights::AsUser
+                                                            : sm::LaunchRights::Default;
+                std::vector<HWND> known = knownBefore;
+                if (!sm::WarmUpBrowser(browser.exe, browser.cls, &known, kWarmTimeoutMs, rights)) {
+                    sm::Trace(L"  «%s»: ранний запуск не удался — работаю как обычно",
+                              sm::FileNameOf(browser.exe).c_str());
+                    continue;
+                }
+                ++warmed;
+                sm::Info(L"  браузер не запущен: поднимаю сразу — %s (записей в раскладке: %d)",
+                         sm::FileNameOf(browser.exe).c_str(), browser.records);
+            }
+            if (warmed > 0) {
+                if (config.autoRestoreDelaySec > 0) {
+                    sm::Info(L"  пауза %d с (AutoRestoreDelay): браузер восстанавливает свои окна",
+                             config.autoRestoreDelaySec);
+                    Sleep(static_cast<DWORD>(config.autoRestoreDelaySec) * 1000);
+                }
+                // Пустые окна, которые браузер открыл сам при холодном старте: в слепке их
+                // нет, а на текущем десктопе они остались бы лишними. Окна восстановленной
+                // сессии к этому моменту уже показывают свои адреса — их не трогаем.
+                for (const BrowserLaunch& browser : browsers) {
+                    if (browser.cls.empty() || !sm::IsExeRunning(browser.exe)) {
+                        continue;
+                    }
+                    const int closed = sm::CloseEmptyBrowserWindows(browser.cls, knownBefore, nullptr);
+                    if (closed > 0) {
+                        sm::Trace(L"  «%s»: закрыто пустых окон после раннего запуска: %d",
+                                  sm::FileNameOf(browser.exe).c_str(), closed);
+                    }
+                }
+            }
+            sm::Info(L"");
+        }
+    } else {
+        sm::Trace(L"--dry-run: ранний запуск браузеров не выполняется");
     }
 
     std::vector<sm::WindowInfo> live;
@@ -1318,9 +1476,10 @@ int RunRestore(const CommandLine& cl) {
         return info.hwnd;
     };
 
-    // Фаза B (PLAN.md §8.3): поднять приложения, окон которых нет. Консоли не
-    // перезапускаем (§9.4: неизвестно, что в них было запущено) — такие записи
-    // уходят в admin.log как ручная работа.
+    // Фаза B (PLAN.md §8.3): поднять приложения, окон которых нет. Консоль с известной
+    // командой (`cmd.exe /c "term.bat"`) перезапускается в своём окне — CONTEXT п. 70;
+    // консоль, у которой в cmdline только имя хоста без аргументов, не перезапускается
+    // (§9.4: неизвестно, что в ней было запущено) — такая запись уходит в admin.log.
     // Окна, существовавшие до запуска: если после старта появилось окно нужного
     // класса, которого в этом списке нет, — это окно запущенного приложения.
     // Explorer и UWP создают окно в уже работающем процессе и пишут в заголовок
@@ -1408,12 +1567,46 @@ int RunRestore(const CommandLine& cl) {
     // холодном старте Firefox сначала восстанавливает сессию, поэтому запас есть.
     // Не нашли — обычное ожидание по процессу и классу (kLaunchTimeoutMs).
     const int kBrowserWindowTimeoutMs = 20000;
+    // Пауза перед переносом: приложения, которые выставляют окно сами уже после появления
+    // (nw.js — AudioPL), иначе переигрывают наш перенос. Ждём, пока прямоугольники окон
+    // перестанут меняться: 2 с тишины, но не дольше 12 с.
+    const int kRectsQuietMs = 2000;
+    const int kRectsMaxMs = 12000;
     int launched = 0;
     int launchFailed = 0;
     int launchSkipped = 0;
     int wouldLaunch = 0;
     // Окна, которые открылись сами (перепроверка перед запуском): запускать не понадобилось.
     int foundOpen = 0;
+
+    // Права восстановления (PLAN.md §9.3). Сам restore может быть повышен — «Запуск от
+    // имени администратора» на ярлыке, AutoRestore, любая повышенная консоль. Тогда обычные
+    // приложения запускаются с токеном оболочки (обычные права), а записи с elevated=1 —
+    // с нашим токеном. При обычном restore наоборот: elevated=1 поднять нельзя, их место
+    // в admin.log (UAC на каждое приложение был бы хуже).
+    const bool selfElevated = sm::IsElevated();
+    int adminOnly = 0;
+
+    // Фаза B идёт тремя шагами (CONTEXT п. 70):
+    //   1) запустить всё, что нужно, — подряд, не дожидаясь окон;
+    //   2) дождаться окна каждого запущенного приложения и подтвердить страницы браузеров;
+    //   3) поставить окна на место — геометрия и десктоп.
+    // Шаги разделены из-за приложений, которые выставляют окно сами уже после появления:
+    // перенос в момент старта они переигрывали, и окно оставалось посреди экрана
+    // (AudioPL с командной строкой nw.exe — CONTEXT п. 70).
+    struct PendingLaunch {
+        size_t record = 0;              // индекс записи в layout.windows
+        sm::LaunchPlan plan;
+        sm::LaunchRights rights = sm::LaunchRights::Default;
+        sm::DesktopTarget target;
+        RECT rect{};
+        DWORD pid = 0;                  // PID запущенного процесса (0 — неизвестен)
+        HWND hwnd = nullptr;            // окно, найденное на шаге ожидания
+        bool exited = false;            // процесс завершился, не показав окна
+        std::vector<HWND> knownBefore;  // окна до старта: для пустых окон браузера
+    };
+    std::vector<PendingLaunch> pending;
+
 
     for (size_t i = 0; i < layout.windows.size(); ++i) {
         if (matched[i] != 0) {
@@ -1459,6 +1652,29 @@ int RunRestore(const CommandLine& cl) {
             continue;
         }
 
+        // Приложение было открыто от администратора (PLAN.md §9.3): обычным процессом его
+        // не поднять (манифест requireAdministrator → ERROR_ELEVATION_REQUIRED), а UAC на
+        // каждое такое приложение — несколько запросов подряд. Запись уходит в admin.log
+        // с подсказкой: запустите restore от имени администратора — тогда он поднимет и
+        // эти окна, а обычные приложения всё равно оставит обычными.
+        if (saved.elevated != 0 && !selfElevated) {
+            ++launchSkipped;
+            ++adminOnly;
+            if (!cl.dryRun) {
+                sm::AddAdminEntry(sm::AdminReason::LaunchElevated, sm::AdminCommand(saved));
+            }
+            sm::Info(L"  не запускаем: %-40s окно было открыто от администратора (%s)",
+                     FitText(saved.title, 40).c_str(),
+                     cl.dryRun ? L"в настоящем запуске — admin.log" : L"admin.log");
+            continue;
+        }
+        // Обычное приложение при повышенном restore — с токеном оболочки, иначе оно станет
+        // администраторским. Записи elevated=1 уже прошли проверку выше: если мы повышенные,
+        // им достаётся наш токен.
+        const sm::LaunchRights rights = (selfElevated && saved.elevated == 0)
+                                            ? sm::LaunchRights::AsUser
+                                            : sm::LaunchRights::Default;
+
         // Pinned-приложение могло остаться запущенным без окна (значок в трее):
         // второй экземпляр не нужен (PLAN.md §8.3 п.1).
         if (saved.pinned != 0 && sm::IsExeRunning(saved.exe)) {
@@ -1473,10 +1689,11 @@ int RunRestore(const CommandLine& cl) {
             if (saved.pinned == 0 && target.kind == sm::DesktopMatchKind::Fallback) {
                 ++wouldFallback;
             }
-            sm::Info(L"  запустил бы: %-10s %s   → стол [%d] %s  %s",
+            sm::Info(L"  запустил бы: %-10s %s   → стол [%d] %s  %s%s",
                      sm::LaunchKindText(plan.kind), FitText(plan.text, 84).c_str(),
                      target.currentIndex, DesktopNameOrStub(target.currentName).c_str(),
-                     saved.show.c_str());
+                     saved.show.c_str(),
+                     rights == sm::LaunchRights::AsUser ? L"  (как пользователь)" : L"");
             // В отчёте строка усечена до ширины экрана — полный текст плана нужен,
             // когда проверяешь, какой именно адрес/команда возьмётся при запуске.
             sm::Trace(L"  план запуска: %s", plan.text.c_str());
@@ -1524,7 +1741,7 @@ int RunRestore(const CommandLine& cl) {
         // своими окнами, а закрывать надо именно то, чего не было (см. ниже).
         const std::vector<HWND> knownBeforeLaunch = knownWindows;
         if (plan.kind == sm::LaunchKind::Browser &&
-            !sm::WarmUpBrowser(saved.exe, saved.cls, &knownWindows, kLaunchTimeoutMs)) {
+            !sm::WarmUpBrowser(saved.exe, saved.cls, &knownWindows, kLaunchTimeoutMs, rights)) {
             sm::Trace(L"  «%s»: прогрев браузера не удался — запускаем как обычно",
                       saved.title.c_str());
         }
@@ -1532,8 +1749,13 @@ int RunRestore(const CommandLine& cl) {
         DWORD pid = 0;
         DWORD launchError = 0;
         std::wstring problem;
-        if (!sm::RunLaunch(plan, &pid, &launchError, &problem)) {
+        if (!sm::RunLaunch(plan, rights, &pid, &launchError, &problem)) {
             ++launchFailed;
+            if (launchError == ERROR_ELEVATION_REQUIRED) {
+                // В слепке права не отмечены (старый файл или процесс не открылся при save),
+                // но приложение требует повышения — та же подсказка, что и для elevated=1.
+                ++adminOnly;
+            }
             sm::Warn(L"«%s»: %s", saved.title.c_str(), problem.c_str());
             // Команда для ручного запуска — независимо от причины: в журнале должен
             // быть полный список того, что не удалось поднять автоматически.
@@ -1544,24 +1766,54 @@ int RunRestore(const CommandLine& cl) {
             continue;
         }
 
-        // Ожидание окна: до 60 с. Приложения (редакторы, IDE, тяжёлые Electron)
-        // открывают окно заметно позже старта процесса, а спешить нам некуда.
-        bool processExited = false;
+        // Шаг 1 — только запуск: окно не ждём, геометрию не ставим. Часть приложений
+        // выставляет своё окно уже после появления, поэтому перенос отложен до шага 3
+        // (CONTEXT п. 70).
+        PendingLaunch item;
+        item.record = i;
+        item.plan = plan;
+        item.rights = rights;
+        item.target = target;
+        item.rect = rect;
+        item.pid = pid;
+        item.knownBefore = knownBeforeLaunch;
+        pending.push_back(item);
+        sm::Info(L"  запускаю: %-40s %s%s", FitText(saved.title, 40).c_str(),
+                 sm::LaunchKindText(plan.kind),
+                 rights == sm::LaunchRights::AsUser ? L" (как пользователь)" : L"");
+    }
+
+    // Шаг 2: ожидание окон. Приложения (редакторы, IDE, тяжёлые Electron) открывают окно
+    // заметно позже старта процесса, время есть — ждём до 60 с. Досрочно прекращаем, если
+    // процесс завершился: тогда окна не будет никогда. Окна соседних запусков не забираем:
+    // приложения запущены все сразу, и две записи одного приложения иначе могли бы
+    // поменяться окнами (otherPids в WaitForWindow).
+    for (PendingLaunch& item : pending) {
+        const sm::LayoutWindow& saved = layout.windows[item.record];
+        std::vector<DWORD> otherPids;
+        for (const PendingLaunch& other : pending) {
+            if (&other != &item && other.pid != 0) {
+                otherPids.push_back(other.pid);
+            }
+        }
+        sm::Info(L"  ждём окно: %-40s (до %d с)", FitText(saved.title, 40).c_str(),
+                 kLaunchTimeoutMs / 1000);
         HWND hwnd = nullptr;
         // Браузер ищем по адресу страницы: у Firefox окно создаёт уже работающий процесс,
         // а после прогрева на столе есть восстановленное окно сессии того же класса —
         // «новое окно класса» могло бы оказаться им (CONTEXT п. 63). Адрес не подтвердился
         // — обычный путь по процессу и классу.
-        if (plan.kind == sm::LaunchKind::Browser && !saved.url.empty()) {
+        if (item.plan.kind == sm::LaunchKind::Browser && !saved.url.empty()) {
             hwnd = sm::WaitForBrowserWindow(saved.cls, saved.url, knownWindows,
                                             kBrowserWindowTimeoutMs);
         }
         if (hwnd == nullptr) {
-            hwnd = sm::WaitForWindow(pid, saved, knownWindows, kLaunchTimeoutMs, &processExited);
+            hwnd = sm::WaitForWindow(item.pid, saved, knownWindows, kLaunchTimeoutMs, &item.exited,
+                                     &otherPids);
         }
         if (hwnd == nullptr) {
             ++launchFailed;
-            if (processExited) {
+            if (item.exited) {
                 sm::Warn(L"«%s»: приложение завершилось, не открыв окна", saved.title.c_str());
                 sm::AddAdminEntry(sm::AdminReason::LaunchFailed, sm::AdminCommand(saved));
             } else {
@@ -1571,51 +1823,70 @@ int RunRestore(const CommandLine& cl) {
             }
             continue;
         }
-
+        item.hwnd = hwnd;
+        knownWindows.push_back(hwnd);  // окно занято: другое приложение его не возьмёт
+        takenWindows.push_back(hwnd);
         // Окно появилось: с этого момента оно тоже кандидат «должно быть на десктопе 0».
-        if (saved.pinned == 0 && target.kind == sm::DesktopMatchKind::Fallback) {
-            rememberFallback(hwnd, target);
+        if (saved.pinned == 0 && item.target.kind == sm::DesktopMatchKind::Fallback) {
+            rememberFallback(hwnd, item.target);
         }
-
         // Браузер: не тащим окно, пока страница не начала открываться. Ожидание не
         // фатально — если адрес так и не подтвердился, окно всё равно ставим на место
         // (иначе оно останется посреди экрана), но факт пишем в Trace.
-        if (plan.kind == sm::LaunchKind::Browser &&
+        if (item.plan.kind == sm::LaunchKind::Browser &&
             !sm::WaitForBrowserPage(hwnd, saved.url, kBrowserReadyTimeoutMs)) {
             sm::Trace(L"  «%s»: страница не подтвердилась — переносим окно как есть",
                       saved.title.c_str());
         }
-
         // Пустое окно, которое браузер открыл сам при старте (его нет в слепке), иначе
         // остаётся висеть на текущем десктопе как «окно со вкладкой по умолчанию».
         // Закрываем только пустые окна, появившиеся после запуска, и только не наше
         // (CONTEXT п. 63).
-        if (plan.kind == sm::LaunchKind::Browser) {
-            const int closed =
-                sm::CloseEmptyBrowserWindows(saved.cls, knownBeforeLaunch, hwnd);
+        if (item.plan.kind == sm::LaunchKind::Browser) {
+            const int closed = sm::CloseEmptyBrowserWindows(saved.cls, item.knownBefore, hwnd);
             if (closed > 0) {
                 sm::Trace(L"  «%s»: закрыто пустых окон браузера: %d", saved.title.c_str(),
                           closed);
             }
         }
+    }
 
-        bool moved = false;
-        std::wstring applyProblem;
-        if (!ApplyMatch(saved, hwnd, rect, sm::ShowCommandFor(saved.show), target, vdm, &moved,
-                        &applyProblem)) {
-            ++launchFailed;
-            sm::Warn(L"«%s»: %s", saved.title.c_str(), applyProblem.c_str());
-            sm::AddAdminEntry(AdminReasonForProblem(applyProblem), sm::AdminCommand(saved));
-            continue;
+    // Шаг 3: окна на место. Сначала ждём, пока запущенные приложения перестанут двигать
+    // свои окна сами (AudioPL выставляет своё окно уже после появления и наш перенос
+    // переигрывал — CONTEXT п. 70), и только потом ставим геометрию и десктоп.
+    if (!cl.dryRun) {
+        std::vector<HWND> launchedWindows;
+        for (const PendingLaunch& item : pending) {
+            if (item.hwnd != nullptr) {
+                launchedWindows.push_back(item.hwnd);
+            }
         }
-        ++launched;
-        knownWindows.push_back(hwnd);  // окно занято: другое приложение его не возьмёт
-        takenWindows.push_back(hwnd);
-        zOrderWindows.push_back(hwnd);
-        zOrderZg.push_back(saved.zg);
-        sm::Info(L"  запущено: %-40s → %s  стол [%d] %s%s", FitText(saved.title, 40).c_str(),
-                 sm::RectToText(rect).c_str(), target.currentIndex,
-                 DesktopNameOrStub(target.currentName).c_str(), moved ? L", перенесено" : L"");
+        if (!launchedWindows.empty()) {
+            sm::Trace(L"  ждём, пока окна запущенных приложений перестанут двигаться сами");
+            WaitRectsStable(launchedWindows, kRectsQuietMs, kRectsMaxMs);
+        }
+        for (PendingLaunch& item : pending) {
+            if (item.hwnd == nullptr) {
+                continue;
+            }
+            const sm::LayoutWindow& saved = layout.windows[item.record];
+            bool moved = false;
+            std::wstring applyProblem;
+            if (!ApplyMatch(saved, item.hwnd, item.rect, sm::ShowCommandFor(saved.show), item.target,
+                            vdm, &moved, &applyProblem)) {
+                ++launchFailed;
+                sm::Warn(L"«%s»: %s", saved.title.c_str(), applyProblem.c_str());
+                sm::AddAdminEntry(AdminReasonForProblem(applyProblem), sm::AdminCommand(saved));
+                continue;
+            }
+            ++launched;
+            zOrderWindows.push_back(item.hwnd);
+            zOrderZg.push_back(saved.zg);
+            sm::Info(L"  запущено: %-40s → %s  стол [%d] %s%s", FitText(saved.title, 40).c_str(),
+                     sm::RectToText(item.rect).c_str(), item.target.currentIndex,
+                     DesktopNameOrStub(item.target.currentName).c_str(),
+                     moved ? L", перенесено" : L"");
+        }
     }
 
     // Фаза C: zg=0 — самое верхнее окно, поэтому поднимаем окна в порядке убывания zg,
@@ -1707,6 +1978,15 @@ int RunRestore(const CommandLine& cl) {
         sm::Warn(L"  окон на десктопе 0: %d — сохранённых десктопов нет в системе; "
                  L"пересохраните раскладку после возврата десктопов",
                  fallbackWindows + fallbackNotMoved);
+    }
+    // Подсказка про права (PLAN.md §9.3): обычный restore не поднимает приложения, которые
+    // были открыты от администратора, — они в admin.log. Повышенный restore поднимет и их,
+    // а остальные приложения всё равно запустит обычными правами.
+    if (adminOnly > 0 && !selfElevated) {
+        sm::Info(L"  окон от администратора не запущено: %d — запустите restore от имени "
+                 L"администратора: обычные приложения он поднимет с обычными правами, а эти — "
+                 L"с повышенными",
+                 adminOnly);
     }
     // PLAN.md §9.3: если что-то требует ручной работы — показываем файл сразу.
     // Журнал всегда переписывается заново: он описывает только этот запуск.
@@ -1846,6 +2126,61 @@ void LoadConfigForAutostart(sm::Config* config) {
     }
     for (const std::wstring& key : config->unknownKeys) {
         sm::Trace(L"Config.ini: ключ «%s» не знаком этой версии — пропущен", key.c_str());
+    }
+}
+
+// --- Права процесса и UAC (PLAN.md §9.3) ---------------------------------------
+// Обычный запуск ScreenMemory повышенных прав не требует: с админским токеном
+// CreateProcess передаёт его всем восстановленным приложениям, а окна приложений,
+// запущенных от администратора, из нашего процесса не двигаются (UIPI). Флаг
+// совместимости «Запуск от имени администратора» в манифесте не виден (там asInvoker),
+// зато даёт запрос UAC на КАЖДЫЙ запуск — поэтому о нём говорим вслух, иначе
+// пользователь видит только «разрешить этому приложению?» и не понимает причины.
+bool RunAsAdminFlagSet() {
+    HKEY key = nullptr;
+    const LSTATUS open = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers", 0,
+        KEY_QUERY_VALUE, &key);
+    if (open != ERROR_SUCCESS) {
+        return false;
+    }
+    // Значение называется полным путём exe, а хранит набор флагов: «~ RUNASADMIN».
+    wchar_t value[64] = L"";
+    DWORD type = 0;
+    DWORD size = sizeof(value) - sizeof(wchar_t);
+    const LSTATUS read = RegQueryValueExW(key, sm::ExePath().c_str(), nullptr, &type,
+                                          reinterpret_cast<BYTE*>(value), &size);
+    RegCloseKey(key);
+    // ERROR_MORE_DATA — флагов больше, чем влезло в буфер: RUNASADMIN стоит первым,
+    // поэтому начала строки достаточно; REG_EXPAND_SZ встречается на старых системах.
+    if ((read != ERROR_SUCCESS && read != ERROR_MORE_DATA) ||
+        (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        return false;
+    }
+    value[_countof(value) - 1] = L'\0';
+    return std::wstring(value).find(L"RUNASADMIN") != std::wstring::npos;
+}
+
+void WarnAboutElevation() {
+    if (sm::IsElevated()) {
+        // Не предупреждение, а пояснение (PLAN.md §9.3): раздача прав теперь раздельная —
+        // обычные приложения получают токен оболочки, повышенными остаются только те окна,
+        // которые и были открыты от администратора.
+        sm::Info(L"процесс запущен с правами администратора: обычные приложения будут "
+                 L"запущены с правами пользователя, а окна, открытые от администратора, — "
+                 L"с повышенными");
+    }
+    if (RunAsAdminFlagSet()) {
+        sm::Warn(L"на exe стоит флаг совместимости «Запуск от имени администратора»: "
+                 L"Windows будет спрашивать UAC при каждом запуске");
+        sm::Info(L"  разделение прав restore делает и без флага; флаг нужен только чтобы "
+                 L"поднимать окна, открытые от администратора, — и тогда UAC спрашивают один "
+                 L"раз за запуск, а не по разу на приложение");
+        sm::Info(L"  снять: Свойства exe → «Совместимость» → снять галочку «Запускать эту "
+                 L"программу от имени администратора»");
+        sm::Info(L"  либо: reg delete \"HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion"
+                 L"\\AppCompatFlags\\Layers\" /v \"%s\" /f", sm::ExePath().c_str());
     }
 }
 
@@ -2146,12 +2481,14 @@ int wmain(int argc, wchar_t** argv) {
         code = RunList(cl);
     } else if (EqualsIgnoreCase(cl.command, L"save")) {
         PrintBanner();
+        WarnAboutElevation();
         // save только записывает то, что видно сейчас: программа мониторов нужна перед
         // восстановлением, когда рабочий стол второго монитора ещё не поднялся.
         sm::Trace(L"save: предварительный шаг (prelaunch) не выполняется");
         code = RunSave(cl);
     } else if (EqualsIgnoreCase(cl.command, L"restore")) {
         PrintBanner();
+        WarnAboutElevation();
         if (cl.dryRun) {
             // --dry-run ничего не меняет, поэтому и предварительный шаг не нужен.
             sm::Trace(L"--dry-run: предварительный шаг (prelaunch) не выполняется");

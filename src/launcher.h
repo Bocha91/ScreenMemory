@@ -36,9 +36,10 @@ struct LaunchPlan {
 };
 
 // Команда запуска по записи слепка (PLAN.md §8.3 п.2). Ничего не запускает.
-// Пропуски: консольные окна (§9.4 — неизвестно, что в них было запущено), браузеры
-// без известного адреса страницы (`browser-no-url`) и записи, для которых нет ни
-// существующего exe, ни запускаемой cmdline.
+// Пропуски: консольные окна, у которых в cmdline только имя хоста без аргументов
+// (§9.4 — неизвестно, что в них было запущено; консоль с аргументами, например
+// `cmd.exe /c "term.bat"`, перезапускается), браузеры без известного адреса страницы
+// (`browser-no-url`) и записи, для которых нет ни существующего exe, ни запускаемой cmdline.
 LaunchPlan PlanLaunch(const LayoutWindow& window);
 
 // Готовая для cmd.exe команда по записи слепка — строка для admin.log (§9.3):
@@ -47,9 +48,29 @@ LaunchPlan PlanLaunch(const LayoutWindow& window);
 // Пусто, если не известен даже путь к exe.
 std::wstring AdminCommand(const LayoutWindow& window);
 
+// Права, с которыми запускается приложение (PLAN.md §9.3).
+enum class LaunchRights {
+    // Токен нашего процесса. Обычный restore → обычные процессы; restore, запущенный
+    // от администратора, → администраторские (так же, как `explorer.exe` из «повышенной»
+    // консоли: дочерний процесс наследует токен вызывающего).
+    Default,
+    // Принудительно обычные права: процесс создаётся с токеном рабочего стола
+    // (explorer.exe) и его окружением. Нужно, чтобы restore, запущенный от
+    // администратора, не делал администраторскими все приложения: иначе второй
+    // Проводник открывается «поверх» рабочего стола, браузер не видит профиль
+    // пользователя, а UWP не активируется (PLAN.md §9.3).
+    AsUser,
+};
+
+// «как пользователь» | «как вызвавший процесс» — для отчёта и --dry-run.
+const wchar_t* LaunchRightsText(LaunchRights rights);
+
 // Запуск процесса по плану. pid — PID созданного процесса (0 у UWP, если
 // менеджер активации его не вернул); errorCode — код WinAPI/HRESULT.
-bool RunLaunch(const LaunchPlan& plan, DWORD* pid, DWORD* errorCode, std::wstring* error);
+// rights == AsUser требует включённых привилегий администратора (SeIncreaseQuota /
+// SeAssignPrimaryToken / SeImpersonate): вызывать только из повышенного процесса.
+bool RunLaunch(const LaunchPlan& plan, LaunchRights rights, DWORD* pid, DWORD* errorCode,
+               std::wstring* error);
 
 // Ожидание окна запущенного приложения: опрос каждые 250 мс. Окно принимается,
 // если совпал PID, либо точно совпал заголовок, либо это окно того же класса,
@@ -59,8 +80,11 @@ bool RunLaunch(const LaunchPlan& plan, DWORD* pid, DWORD* errorCode, std::wstrin
 // 0 — окно не появилось за timeoutMs. processExited (если передан) — процесс
 // завершился, не создав окна: ждать дальше бессмысленно, ожидание прекращается
 // досрочно (приложение упало или сразу закрылось).
+// otherPids (если передан) — PID других наших запусков: их окна не принимаются
+// (в фазе B приложения запускаются все сразу, см. CONTEXT п. 70).
 HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>& knownWindows,
-                   int timeoutMs, bool* processExited = nullptr);
+                   int timeoutMs, bool* processExited = nullptr,
+                   const std::vector<DWORD>* otherPids = nullptr);
 
 // Пауза перед переносом окна браузера: Chrome/Edge показывают окно раньше, чем
 // открывают страницу, и перенос в этот момент — самое «спешное» действие из всех
@@ -91,8 +115,10 @@ HWND WaitForBrowserWindow(const std::wstring& cls, const std::wstring& expectedU
 // восстановленное окно сессии за только что открытое.
 // true — браузер уже работал либо прогрев дошёл до его окна; false — прогрев не удался
 // (вызывающий запускает как обычно, поведение остаётся прежним).
+// rights — права прогрева: он тоже запуск приложения, и при restore от администратора
+// обычный браузер должен подняться обычными правами (§9.3).
 bool WarmUpBrowser(const std::wstring& exePath, const std::wstring& cls,
-                   std::vector<HWND>* knownWindows, int timeoutMs);
+                   std::vector<HWND>* knownWindows, int timeoutMs, LaunchRights rights);
 
 // Закрывает пустые окна класса cls, которых не было до запуска (knownWindows — окна
 // на момент ДО прогрева), кроме keep: это окна, которые браузер открыл сам при старте

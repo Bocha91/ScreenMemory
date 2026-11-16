@@ -14,6 +14,11 @@ rem  value, a wrong command) and the day chain - a snapshot taken before the
 rem  current boot must be copied into the "yesterday" slot exactly once, and a
 rem  repeated restore must not add another copy. The chain check builds a fake
 rem  0-window snapshot, so that real restore moves nothing.
+rem  New in 0.9.3: rights separation (PLAN.md 9.3). A fake snapshot with one
+rem  window saved as elevated=1 must be reported and sent to admin.log instead of
+rem  being launched with the current (possibly elevated) token; the check is done
+rem  with restore --dry-run and tests\check_rights.ps1, and it skips itself when
+rem  the smoke test runs elevated.
 rem
 rem  The exe is copied into a throwaway sandbox and runs from there: the program
 rem  keeps layout.txt / admin.log next to itself, and "save" would otherwise
@@ -64,6 +69,7 @@ call :run "AutoSave restore" 64
 call :run "AutoSave --list" 64
 call :run "--list --version" 64
 call :checkchain "%SANDBOX%"
+call :checkrights "%SANDBOX%"
 del /q "%TEMP%\ScreenMemory-AutoSave.xml" >nul 2>&1
 del /q "%TEMP%\ScreenMemory-AutoRestore.xml" >nul 2>&1
 
@@ -156,6 +162,63 @@ for /f %%c in ('dir /b /a-d "%~1\layout-*.txt" 2^>nul ^| find /c /v ""') do set 
 set "TS=0"
 for /f %%c in ('dir /b /a-d "%~1\layout-2*.txt" 2^>nul ^| find /c /v ""') do set "TS=%%c"
 set /a "%~2=ALL-TS"
+exit /b 0
+
+:checkrights
+set "D=%~1"
+rem Paths in layout.txt are escaped: one backslash must be written as two.
+set "ESC=%D:\=\\%"
+> "%D%\layout.txt" (
+    echo # ScreenMemory layout v1
+    echo # saved=2099-01-01T00:00:00  screen=1920x1080  monitors=1  desktops=1  windows=2
+    echo [desktop.0]
+    echo guid={3F2A1B4C-5D6E-4F70-8192-A3B4C5D6EF01}
+    echo name=Desktop 1
+    echo.
+    echo [monitor.0]
+    echo device=\\\\.\\DISPLAY1
+    echo rect=0,0,1920,1080
+    echo work=0,0,1920,1040
+    echo dpi=96
+    echo primary=1
+    echo.
+    echo [window.0]
+    echo desktop=0
+    echo desktop_name=Desktop 1
+    echo pinned=0
+    echo zg=0
+    echo exe=%ESC%\\ScreenMemory.exe
+    echo class=Notepad
+    echo title=rights check
+    echo monitor=\\\\.\\DISPLAY1
+    echo mrel=0,0,100,100
+    echo rect=0,0,100,100
+    echo show=normal
+    echo uwp=0
+    echo elevated=1
+    echo.
+    echo [window.1]
+    echo desktop=0
+    echo desktop_name=Desktop 1
+    echo pinned=0
+    echo zg=0
+    echo exe=%ESC%\\ScreenMemory.exe
+    echo class=Notepad
+    echo title=rights check plain
+    echo monitor=\\\\.\\DISPLAY1
+    echo mrel=0,0,200,200
+    echo rect=0,0,200,200
+    echo show=normal
+    echo uwp=0
+    echo elevated=0
+)
+"%D%\ScreenMemory.exe" restore --dry-run > "%D%\rights.txt" 2>&1
+set "GOT=%errorlevel%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "tests\check_rights.ps1" -LogPath "%D%\rights.txt" -ExpectedExit 0 -ActualExit %GOT%
+if errorlevel 1 (
+    echo [smoke] FAIL  rights: elevated window must go to admin.log, not to a plain launch
+    set /a FAILED+=1
+)
 exit /b 0
 
 :run

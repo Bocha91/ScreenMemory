@@ -1,0 +1,254 @@
+Вопрос: 
+Приложение, написанное для Windows 10 на C++. У меня такой вопрос: а может ли приложение, запущенное от администратора, запустить другую программу, но с правами обычного пользователя?
+Ответ:
+Да, может. Приложение с правами администратора (elevated) может запустить дочерний процесс с обычными правами (medium integrity level) через стандартный Windows API.
+По умолчанию функция CreateProcess наследует токен безопасности родителя. Чтобы понизить права нового процесса, нужно явно подменить этот токен.
+
+Основные способы реализации на C++
+
+• Использование токена оболочки (Shell Token). Это самый надежный и распространенный способ. Программа находит процесс проводника (explorer.exe), который почти всегда запущен от имени текущего обычного пользователя, копирует его токен через OpenProcessToken и DuplicateTokenEx, а затем запускает целевую программу через CreateProcessWithTokenW или CreateProcessAsUser.
+• Создание ограниченного токена (Restricted Token). Приложение берет свой собственный токен администратора и урезает его привилегии с помощью функции CreateRestrictedToken (удаляя SID группы администраторов и понижая уровень целостности до SECURITY_MANDATORY_MEDIUM_RID). После этого процесс запускается через CreateProcessAsUser.
+• Делегирование через Планировщик заданий (Task Scheduler). Через COM-интерфейс ITaskService можно программно создать или запустить задачу от имени интерактивного пользователя без повышенных прав. Этот подход часто используют установщики, чтобы запустить программу после завершения инсталляции.
+
+Пример логики через токен Explorer
+
+Ниже приведена минимальная схема того, как это делается через получение токена рабочего стола (требует линковки с Advapi32.lib и User32.lib):
+cpp
+#include <windows.h>
+#include <tlhelp32.h>
+
+bool RunAsDesktopUser(const wchar_t* appPath, wchar_t* cmdLine) {
+    // 1. Находим окно рабочего стола и PID процесса explorer.exe
+    HWND hwnd = GetShellWindow();
+    if (!hwnd) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+
+    // 2. Открываем и дублируем его токен
+    HANDLE hToken = nullptr;
+    HANDLE hNewToken = nullptr;
+    bool result = false;
+
+    if (OpenProcessToken(hProcess, TOKEN_DUPLICATE, &hToken)) {
+        if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &hNewToken)) {
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi = { 0 };
+
+            // 3. Запускаем процесс с дублированным токеном
+            if (CreateProcessWithTokenW(hNewToken, LOGON_WITH_PROFILE, appPath, cmdLine, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                result = true;
+            }
+            CloseHandle(hNewToken);
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return result;
+}
+Используйте код с осторожностью.
+
+Важные нюансы
+
+• Наличие explorer.exe. Метод с GetShellWindow() работает только в том случае, если у пользователя запущена графическая оболочка. Если программа работает как системная служба (Session 0), придется получать токен активной сессии через WTSQueryUserToken.
+• Переменные окружения. При запуске через CreateProcessWithTokenW или CreateProcessAsUser новый процесс может унаследовать переменные окружения администратора. Чтобы избежать проблем с путями (например, к папке %APPDATA%), рекомендуется сформировать чистое окружение пользователя с помощью функции CreateEnvironmentBlock.
+• Привилегия SeIncreaseQuotaPrivilege. Если вы используете CreateProcessAsUser вместо CreateProcessWithTokenW, у вызывающего процесса должна быть включена привилегия SE_INCREASE_QUOTA_NAME.
+Уточните, пожалуйста, ваша программа работает как обычное оконное/консольное приложение или как служба Windows (Service), и нужно ли передавать переменные окружения целевого пользователя? Я смогу адаптировать код и добавить корректную очистку ресурсов.
+
+
+Вопрос: 
+обычное консольное, нужно передавать переменные окружения целевого пользователя.
+Я запускаю приложение через ярлык, который имеет, который имеет галочку запускать от имени администратора. Есть ли в этом случае какие-то нюансы и нужно ли указывать от имени какого пользователя запускать не админские приложения?
+Ответ:
+Указывать имя пользователя вручную не нужно. При запуске через ярлык с галочкой «Запуск от имени администратора» оба процесса (и explorer.exe, и ваша консоль) работают в одной и той же пользовательской сессии. Система сама подхватит нужного пользователя, если взять токен у explorer.exe.
+
+Нюансы запуска через ярлык администратора
+
+• Один и тот же пользователь, разные токены. Когда вы ставите галочку в ярлыке, срабатывает UAC. Он берет вашу текущую учетную запись и выдает программе «полный» токен (Full Token), в то время как explorer.exe продолжает работать с «ограниченным» токеном (Filtered Token) того же самого пользователя.
+• Блок окружения (Environment Block). Даже если пользователь один и тот же, в окружении повышенного процесса могут быть лишние или измененные переменные. Чтобы целевая программа получила чистое окружение, нужно использовать функцию CreateEnvironmentBlock из библиотеки Userenv.lib и обязательно передать флаг CREATE_UNICODE_ENVIRONMENT при запуске процесса.
+• Проблема с CreateProcessWithTokenW. Эта функция удобна, но она плохо дружит с передачей кастомного блока переменных окружения в некоторых версиях Windows (может возвращать ошибку ERROR_INVALID_PARAMETER или игнорировать блок). Для надежной передачи окружения лучше использовать CreateProcessAsUserW с предварительным включением привилегий.
+• Консольное окно. Если вы запускаете из консоли другую консольную программу, она по умолчанию привяжется к текущему окну (с правами администратора), что не сработает из-за изоляции UIPI. Для дочерней консольной программы нужно передавать флаг CREATE_NEW_CONSOLE, а для оконной — можно обойтись без него.
+
+Готовый код на C++ с передачей окружения
+
+Для сборки этого кода потребуется подключить библиотеки Advapi32.lib, User32.lib и Userenv.lib.
+cpp
+#include <windows.h>
+#include <userenv.h>
+#include <iostream>
+
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "User32.lib")
+#pragma comment(lib, "Userenv.lib")
+
+// Вспомогательная функция для включения нужных привилегий у текущего процесса
+bool EnablePrivilege(LPCWSTR privilegeName) {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp = { 0 };
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    bool result = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr) 
+                  && (GetLastError() == ERROR_SUCCESS);
+    CloseHandle(hToken);
+    return result;
+}
+
+bool RunAsRegularUser(const wchar_t* appPath, wchar_t* cmdLine, bool isConsoleApp) {
+    // Включаем привилегии, необходимые для CreateProcessAsUserW
+    EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+    EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+
+    // 1. Находим PID процесса explorer.exe
+    HWND hwnd = GetShellWindow();
+    if (!hwnd) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+
+    // 2. Получаем и дублируем его токен
+    HANDLE hToken = nullptr;
+    HANDLE hPrimaryToken = nullptr;
+    bool success = false;
+
+    if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
+        if (DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &hPrimaryToken)) {
+            
+            // 3. Формируем блок переменных окружения целевого пользователя
+            LPVOID envBlock = nullptr;
+            if (CreateEnvironmentBlock(&envBlock, hPrimaryToken, FALSE)) {
+                
+                STARTUPINFOW si = { sizeof(si) };
+                si.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default"); // Указываем рабочий стол пользователя
+                PROCESS_INFORMATION pi = { 0 };
+
+                // Флаг CREATE_UNICODE_ENVIRONMENT обязателен при работе с CreateEnvironmentBlock
+                DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT;
+                if (isConsoleApp) {
+                    creationFlags |= CREATE_NEW_CONSOLE;
+                }
+
+                // 4. Запускаем процесс с правами обычного пользователя и его окружением
+                if (CreateProcessAsUserW(
+                        hPrimaryToken,
+                        appPath,
+                        cmdLine,
+                        nullptr,
+                        nullptr,
+                        FALSE,
+                        creationFlags,
+                        envBlock,
+                        nullptr, // Рабочая директория (можно передать путь к папке)
+                        &si,
+                        &pi)) {
+                    
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    success = true;
+                }
+
+                DestroyEnvironmentBlock(envBlock);
+            }
+            CloseHandle(hPrimaryToken);
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return success;
+}
+
+int main() {
+    // Пример запуска обычного Блокнота (оконное приложение)
+    wchar_t cmd[] = L"notepad.exe";
+    if (RunAsRegularUser(L"C:\\Windows\\System32\\notepad.exe", cmd, false)) {
+        std::wcout << L"Процесс успешно запущен без прав администратора.\n";
+    } else {
+        std::wcout << L"Ошибка запуска: " << GetLastError() << L"\n";
+    }
+    return 0;
+}
+Используйте код с осторожностью.
+
+Что важно учесть при интеграции
+
+• Рабочая директория (Current Directory). В вызове CreateProcessAsUserW предпоследним параметром сейчас передается nullptr. В этом случае дочерняя программа унаследует текущую папку вашего консольного приложения. Если ваша консоль запущена из системной папки (например, C:\Windows\System32), у обычного пользователя не будет прав на запись туда. Лучше явно передавать путь к папке, где лежит запускаемый файл.
+• Передача аргументов. Второй параметр (cmdLine) в функции CreateProcessAsUserW не может быть константной строкой (функция модифицирует буфер внутри себя). Всегда передавайте изменяемый массив wchar_t[], как в примере выше.
+• Редкий случай с UAC. Если на компьютере полностью отключен UAC через реестр (EnableLUA = 0), то explorer.exe сам работает с правами администратора. В такой конфигурации понизить права через копирование токена оболочки не получится.
+Нужно ли вашему приложению дожидаться завершения запущенной программы и перехватывать её вывод (stdout/stderr), или достаточно просто запустить её в фоне?
+
+Вопрос: 
+Можно ли с помощью WinAPI получить информацию о запущенных приложениях, от кого они запущены? От администратора или от пользователя, если у приложения нету прав администратора?
+Ответ:
+Да, можно, но с ограничениями. Обычное приложение без прав администратора может получить эту информацию о процессах текущего пользователя, но не о системных службах или процессах других пользователей.
+Если ваша программа не имеет прав администратора, при попытке открыть дескриптор чужого или системного процесса через OpenProcess система вернет ошибку ERROR_ACCESS_DENIED (5).
+
+Что именно можно узнать без прав администратора
+
+• Свои процессы с обычными правами (Medium Integrity). Вы можете свободно открыть их через OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...), прочитать токен (OpenProcessToken) и узнать имя пользователя, SID и статус повышения прав (Elevation).
+• Свои процессы с правами администратора (High Integrity). В Windows 10 флаг PROCESS_QUERY_LIMITED_INFORMATION позволяет непривилегированному процессу получить базовую информацию о процессе с повышенными правами того же пользователя. В большинстве случаев вы сможете прочитать его токен и увидеть, что он запущен от администратора (TokenElevation), но для защищенных процессов (Protected Processes) доступ всё равно будет закрыт.
+• Чужие и системные процессы (SYSTEM, LocalService). Открыть их токен без прав администратора не получится. Однако имя пользователя, которому принадлежит процесс, можно узнать обходным путем через API терминальных служб (WTSEnumerateProcessesW), который не требует открытия дескриптора самого процесса.
+
+Как проверить, запущен ли процесс от администратора
+
+Для проверки конкретного процесса используется функция GetTokenInformation с параметром TokenElevation.
+cpp
+#include <windows.h>
+#include <iostream>
+
+// Возвращает: 1 - от админа, 0 - обычный пользователь, -1 - нет доступа/ошибка
+int IsProcessElevated(DWORD pid) {
+    // Используем PROCESS_QUERY_LIMITED_INFORMATION — он работает даже для процессов с более высокими правами
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) {
+        return -1; // Ошибка доступа (например, системный процесс или чужой пользователь)
+    }
+
+    HANDLE hToken = nullptr;
+    int result = -1;
+
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elevation;
+        DWORD dwSize = sizeof(TOKEN_ELEVATION);
+
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+            result = elevation.TokenIsElevated ? 1 : 0;
+        }
+        CloseHandle(hToken);
+    }
+
+    CloseHandle(hProcess);
+    return result;
+}
+Используйте код с осторожностью.
+
+Как узнать имя пользователя (владельца процесса)
+
+Если функция IsProcessElevated вернула 0 или 1 (то есть токен удалось открыть), имя владельца можно достать из того же токена через GetTokenInformation(hToken, TokenUser, ...) и перевести SID в строку с помощью LookupAccountSidW.
+Если же процесс системный и OpenProcess возвращает отказ в доступе, можно использовать WTSEnumerateProcessesW (из библиотеки Wtsapi32.lib). Эта функция возвращает список всех процессов в системе вместе с их SID, что позволяет узнать имя пользователя даже для системных служб (например, SYSTEM), но не дает информации о том, повышен ли токен через UAC.
+
+Особенности при отключенном UAC
+
+• Поведение TokenElevation. Если на компьютере отключен UAC (EnableLUA = 0), все процессы пользователя из группы «Администраторы» сразу запускаются с полными правами, и TokenIsElevated для них будет возвращать 1 (или 0 в зависимости от политики, так как разделения токенов нет).
+• Проверка членства в группе. Для более точной проверки прав в таких условиях дополнительно проверяют наличие SID встроенной группы администраторов (DOMAIN_ALIAS_RID_ADMINS) в токене процесса с помощью функции CheckTokenMembership.
+Вам нужно проверять конкретный известный процесс (по имени или PID) или составить полный список всех запущенных программ в системе с их статусами? Я могу показать рабочий пример перебора процессов.

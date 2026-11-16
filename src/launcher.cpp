@@ -3,8 +3,10 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <userenv.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwctype>
 #include <string>
 #include <vector>
@@ -49,6 +51,55 @@ std::wstring DirectoryOf(const std::wstring& path) {
 
 std::wstring Quote(const std::wstring& text) {
     return L"\"" + text + L"\"";
+}
+
+// Консольная ли это программа — по подсистеме в заголовке PE (IMAGE_SUBSYSTEM_WINDOWS_CUI).
+// Нужно, чтобы правильно создать процесс (CONTEXT п. 70): GUI-приложению консоль restore
+// не нужна вовсе, консольной программе (cmd.exe с сохранённой командой) нужно собственное
+// окно, в котором человек сможет работать и которое можно закрыть, не тронув остальное.
+// Заголовок читаем сами: список «известных консольных хостов» пришлось бы пополнять
+// вручную, а подсистема — свойство самого файла.
+bool IsConsoleImage(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool console = false;
+    IMAGE_DOS_HEADER dos{};
+    DWORD read = 0;
+    if (ReadFile(file, &dos, sizeof(dos), &read, nullptr) != FALSE && read == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0) {
+        // Необязательный заголовок PE32 и PE32+ отличается только полем ImageBase
+        // (4 байта против 8), а до Subsystem от его начала — 68 байт в обеих
+        // разновидностях: Magic (2), линкер (2), пять DWORD, ImageBase, два DWORD
+        // выравнивания, шесть WORD версий, три DWORD, CheckSum.
+        constexpr size_t kSubsystemOffset = 68;
+        constexpr size_t kPrefixSize = 4 + sizeof(IMAGE_FILE_HEADER) + kSubsystemOffset + sizeof(WORD);
+        std::vector<char> header(kPrefixSize, 0);
+        if (SetFilePointer(file, static_cast<LONG>(dos.e_lfanew), nullptr, FILE_BEGIN) !=
+                INVALID_SET_FILE_POINTER &&
+            ReadFile(file, header.data(), static_cast<DWORD>(header.size()), &read, nullptr) != FALSE &&
+            read == static_cast<DWORD>(header.size())) {
+            const size_t optional = 4 + sizeof(IMAGE_FILE_HEADER);
+            DWORD signature = 0;
+            WORD magic = 0;
+            WORD subsystem = 0;
+            memcpy(&signature, header.data(), sizeof(signature));
+            memcpy(&magic, header.data() + optional, sizeof(magic));
+            memcpy(&subsystem, header.data() + optional + kSubsystemOffset, sizeof(subsystem));
+            if (signature == IMAGE_NT_SIGNATURE &&
+                (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC || magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)) {
+                console = (subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI);
+            }
+        }
+    }
+    CloseHandle(file);
+    return console;
 }
 
 // Первый токен командной строки: в кавычках либо до первого пробела.
@@ -153,6 +204,174 @@ std::wstring ExplorerPath() {
 
 }  // namespace
 
+namespace {
+
+// Привилегия вызывающего процесса (нужна CreateProcessAsUser). Её отсутствие — не
+// приговор: тогда сработает запасной путь через CreateProcessWithTokenW.
+bool EnablePrivilege(const wchar_t* name) {
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) ==
+        FALSE) {
+        return false;
+    }
+    bool ok = false;
+    LUID luid{};
+    if (LookupPrivilegeValueW(nullptr, name, &luid) != FALSE) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr,
+                                   nullptr) != FALSE &&
+             GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return ok;
+}
+
+// Токен рабочего стола: у explorer.exe обычные права даже тогда, когда ярлык restore
+// помечен «Запуск от имени администратора» (UAC выдаёт повышенный токен только нам,
+// оболочка остаётся с ограниченным токеном того же пользователя).
+struct ShellToken {
+    HANDLE primary = nullptr;      // дубликат токена оболочки как primary-токен
+    LPVOID environment = nullptr;  // окружение пользователя (CreateEnvironmentBlock)
+
+    ~ShellToken() {
+        if (environment != nullptr) {
+            DestroyEnvironmentBlock(environment);
+        }
+        if (primary != nullptr) {
+            CloseHandle(primary);
+        }
+    }
+    ShellToken() = default;
+    ShellToken(const ShellToken&) = delete;
+    ShellToken& operator=(const ShellToken&) = delete;
+};
+
+// Токен оболочки текущего пользователя. false — причина в error.
+bool OpenShellToken(ShellToken* out, std::wstring* error) {
+    // GetShellWindow — окно Progman рабочего стола текущего пользователя.
+    const HWND shell = GetShellWindow();
+    if (shell == nullptr) {
+        if (error != nullptr) {
+            *error = L"окно оболочки не найдено (GetShellWindow): рабочий стол не запущен?";
+        }
+        return false;
+    }
+    DWORD shellPid = 0;
+    GetWindowThreadProcessId(shell, &shellPid);
+    if (shellPid == 0 || shellPid == GetCurrentProcessId()) {
+        if (error != nullptr) {
+            *error = L"процесс оболочки не определён";
+        }
+        return false;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shellPid);
+    if (process == nullptr) {
+        if (error != nullptr) {
+            *error = L"OpenProcess(оболочка): " + Win32ErrorText(GetLastError());
+        }
+        return false;
+    }
+
+    bool ok = false;
+    HANDLE token = nullptr;
+    if (OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &token) != FALSE) {
+        HANDLE primary = nullptr;
+        if (DuplicateTokenEx(token, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary,
+                             &primary) != FALSE) {
+            // Оболочка тоже может быть повышена (UAC выключен, explorer.exe запущен от
+            // администратора): копией такого токена права не понизить — говорим об этом
+            // явно, иначе обещание «обычные приложения — обычными правами» молча нарушится.
+            TOKEN_ELEVATION elevation{};
+            DWORD size = sizeof(elevation);
+            const bool shellElevated =
+                GetTokenInformation(primary, TokenElevation, &elevation, sizeof(elevation),
+                                    &size) != FALSE &&
+                elevation.TokenIsElevated != 0;
+            if (!shellElevated) {
+                LPVOID environment = nullptr;
+                if (CreateEnvironmentBlock(&environment, primary, FALSE) == FALSE) {
+                    environment = nullptr;  // не фатально: останется окружение вызывающего
+                }
+                out->primary = primary;
+                out->environment = environment;
+                ok = true;
+            } else {
+                CloseHandle(primary);
+                if (error != nullptr) {
+                    *error = L"оболочка запущена от администратора (UAC отключён?): права не понизить";
+                }
+            }
+        } else if (error != nullptr) {
+            *error = L"DuplicateTokenEx: " + Win32ErrorText(GetLastError());
+        }
+        CloseHandle(token);
+    } else if (error != nullptr) {
+        *error = L"OpenProcessToken(оболочка): " + Win32ErrorText(GetLastError());
+    }
+    CloseHandle(process);
+    return ok;
+}
+
+// Запуск с токеном оболочки: обычные права и окружение пользователя (PLAN.md §9.3).
+// Вызывать только из повышенного процесса — иначе нужных привилегий нет и вернётся ошибка.
+bool RunAsDesktopUser(LPCWSTR appName, wchar_t* command, DWORD consoleFlags,
+                      const std::wstring& workDir, DWORD* pid, DWORD* errorCode,
+                      std::wstring* error) {
+    ShellToken shell;
+    std::wstring tokenError;
+    if (!OpenShellToken(&shell, &tokenError)) {
+        if (errorCode != nullptr) {
+            *errorCode = ERROR_ACCESS_DENIED;
+        }
+        if (error != nullptr) {
+            *error = L"права пользователя недоступны: " + tokenError;
+        }
+        return false;
+    }
+
+    EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+    EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    // Чужой токен без явного рабочего стола может оказаться вне интерактивной сессии.
+    si.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+    PROCESS_INFORMATION pi{};
+    const DWORD flags = CREATE_UNICODE_ENVIRONMENT | consoleFlags;
+    LPCWSTR dir = workDir.empty() ? nullptr : workDir.c_str();
+
+    if (CreateProcessAsUserW(shell.primary, appName, command, nullptr, nullptr, FALSE, flags,
+                             shell.environment, dir, &si, &pi) == FALSE) {
+        const DWORD first = GetLastError();
+        // Политика может запрещать SeIncreaseQuota/SeAssignPrimaryToken: тот же токен
+        // через CreateProcessWithTokenW — ему достаточно SeImpersonatePrivilege.
+        if (CreateProcessWithTokenW(shell.primary, 0, appName, command, flags, shell.environment,
+                                    dir, &si, &pi) == FALSE) {
+            const DWORD second = GetLastError();
+            if (errorCode != nullptr) {
+                *errorCode = second != 0 ? second : first;
+            }
+            if (error != nullptr) {
+                *error = L"CreateProcessAsUser: " + Win32ErrorText(first) +
+                         L", CreateProcessWithToken: " + Win32ErrorText(second);
+            }
+            return false;
+        }
+    }
+    if (pid != nullptr) {
+        *pid = pi.dwProcessId;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+}  // namespace
+
 const wchar_t* LaunchKindText(LaunchKind kind) {
     switch (kind) {
         case LaunchKind::Explorer:
@@ -172,6 +391,10 @@ const wchar_t* LaunchKindText(LaunchKind kind) {
     }
 }
 
+const wchar_t* LaunchRightsText(LaunchRights rights) {
+    return rights == LaunchRights::AsUser ? L"как пользователь" : L"как вызвавший процесс";
+}
+
 bool IsConsoleClass(const std::wstring& cls) {
     // VirtualConsoleClass — ConEmu, CASCADIA_HOSTING_WINDOW_CLASS — Windows Terminal.
     // PseudoConsoleWindow — окно консоли, созданной через ConPTY.
@@ -183,10 +406,20 @@ bool IsConsoleClass(const std::wstring& cls) {
 LaunchPlan PlanLaunch(const LayoutWindow& window) {
     LaunchPlan plan;
 
-    // PLAN.md §9.4: в cmdline консольного окна лежит командная строка хоста, а не
-    // того, что в консоли запущено. Повторный запуск открыл бы пустое окно, поэтому
-    // такие записи не перезапускаем — они уходят в admin.log как ручная работа.
+    // PLAN.md §9.4: в cmdline консольного окна лежит командная строка хоста, а не того,
+    // что в консоли запущено, — повторный запуск «как есть» открыл бы пустое окно. Но если
+    // у хоста есть аргументы (`cmd.exe /c "term.bat"`), это и есть то, что было запущено,
+    // и такую команду повторяем в своём окне консоли (CONTEXT п. 70). Хост без аргументов
+    // (`cmd.exe`, `powershell.exe`) по-прежнему не перезапускается: содержимое неизвестно.
     if (IsConsoleClass(window.cls)) {
+        const std::wstring first = FirstToken(window.cmdline);
+        if (!window.cmdline.empty() && FileExists(first) &&
+            !Trim(ArgumentsOf(window.cmdline, first)).empty()) {
+            plan.kind = LaunchKind::Cmdline;
+            plan.args = window.cmdline;
+            plan.text = window.cmdline;
+            return plan;
+        }
         plan.skipReason = L"console";
         return plan;
     }
@@ -293,7 +526,8 @@ std::wstring AdminCommand(const LayoutWindow& window) {
 
 
 
-bool RunLaunch(const LaunchPlan& plan, DWORD* pid, DWORD* errorCode, std::wstring* error) {
+bool RunLaunch(const LaunchPlan& plan, LaunchRights rights, DWORD* pid, DWORD* errorCode,
+               std::wstring* error) {
     if (pid != nullptr) {
         *pid = 0;
     }
@@ -360,11 +594,30 @@ bool RunLaunch(const LaunchPlan& plan, DWORD* pid, DWORD* errorCode, std::wstrin
 
     const std::wstring workDir = DirectoryOf(plan.app.empty() ? FirstToken(plan.args) : plan.app);
 
+    // Консоль дочернего процесса не должна быть нашей (CONTEXT п. 70). Без своих флагов
+    // процесс подключается к консоли restore: его вывод попадает в наш отчёт (в логе
+    // restore от 16.11.2026 видны строки VS Code), а закрытие окна консоли или Ctrl+C
+    // в нём рассылает CTRL_CLOSE всем подключённым — так вместе с restore закрылись
+    // запущенные им редакторы. GUI-приложение получает собственную невидимую консоль,
+    // консольная программа — собственное окно, которое видно и закрывается отдельно.
+    const std::wstring imagePath = plan.app.empty() ? FirstToken(plan.args) : plan.app;
+    const DWORD consoleFlags = IsConsoleImage(imagePath) ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(appName, buffer.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT,
-                        nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
+
+    // Понижение прав (PLAN.md §9.3): обычное приложение при restore, запущенном от
+    // администратора, должно остаться обычным — иначе оно наследует наш токен и станет
+    // администраторским (второй Проводник, чужой профиль браузера, неактивируемый UWP).
+    if (rights == LaunchRights::AsUser) {
+        return RunAsDesktopUser(appName, buffer.data(), consoleFlags, workDir, pid, errorCode,
+                                error);
+    }
+
+    if (!CreateProcessW(appName, buffer.data(), nullptr, nullptr, FALSE,
+                        CREATE_UNICODE_ENVIRONMENT | consoleFlags, nullptr,
+                        workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
         const DWORD code = GetLastError();
         if (errorCode != nullptr) {
             *errorCode = code;
@@ -392,6 +645,10 @@ struct WaitContext {
     std::wstring cls;                 // класс окна из слепка
     std::wstring title;               // заголовок из слепка
     const std::vector<HWND>* known = nullptr;  // окна, существовавшие до запуска
+    // PID других наших запусков: в фазе B все приложения запускаются сразу, и окно
+    // соседнего запуска забирать нельзя — две записи одного приложения поменялись бы
+    // окнами (CONTEXT п. 70).
+    const std::vector<DWORD>* otherPids = nullptr;
     HWND found = nullptr;
     int score = 0;
 };
@@ -414,6 +671,11 @@ BOOL CALLBACK WaitProc(HWND hwnd, LPARAM param) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0 || pid == ctx->selfPid) {
+        return TRUE;
+    }
+    // Окно другого нашего запуска: не наше, что бы о нём ни говорили класс и свежесть.
+    if (ctx->otherPids != nullptr &&
+        std::find(ctx->otherPids->begin(), ctx->otherPids->end(), pid) != ctx->otherPids->end()) {
         return TRUE;
     }
 
@@ -456,13 +718,14 @@ BOOL CALLBACK WaitProc(HWND hwnd, LPARAM param) {
 }  // namespace
 
 HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>& knownWindows,
-                   int timeoutMs, bool* processExited) {
+                   int timeoutMs, bool* processExited, const std::vector<DWORD>* otherPids) {
     WaitContext ctx;
     ctx.pid = pid;
     ctx.selfPid = GetCurrentProcessId();
     ctx.cls = saved.cls;
     ctx.title = saved.title;
     ctx.known = &knownWindows;
+    ctx.otherPids = otherPids;
 
     if (processExited != nullptr) {
         *processExited = false;
@@ -594,7 +857,7 @@ bool IsStartupTitle(const std::wstring& title) {
 }  // namespace
 
 bool WarmUpBrowser(const std::wstring& exePath, const std::wstring& cls,
-                   std::vector<HWND>* knownWindows, int timeoutMs) {
+                   std::vector<HWND>* knownWindows, int timeoutMs, LaunchRights rights) {
     if (exePath.empty() || cls.empty()) {
         return true;  // окно ищется по классу: без него прогрев бессмыслен
     }
@@ -609,7 +872,7 @@ bool WarmUpBrowser(const std::wstring& exePath, const std::wstring& cls,
     DWORD pid = 0;
     DWORD code = 0;
     std::wstring error;
-    if (!RunLaunch(warm, &pid, &code, &error)) {
+    if (!RunLaunch(warm, rights, &pid, &code, &error)) {
         Trace(L"  прогрев браузера: %s", error.c_str());
         return false;
     }
@@ -829,8 +1092,11 @@ PreLaunchResult RunPreLaunch(const std::wstring& exePath, const std::wstring& ar
     const std::wstring workDir = DirectoryOf(exePath);
     const ULONGLONG started = GetTickCount64();
     // Рабочая папка — папка программы: утилиты ищут рядом с собой ini-файлы и профили.
-    if (CreateProcessW(exePath.c_str(), mutableLine.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                       workDir.empty() ? nullptr : workDir.c_str(), &si, &pi) == FALSE) {
+    // Консоль — своя, а не консоль restore (CONTEXT п. 70): утилита мониторов обычно
+    // графическая и получает невидимую консоль, консольная — собственное окно.
+    const DWORD consoleFlags = IsConsoleImage(exePath) ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+    if (CreateProcessW(exePath.c_str(), mutableLine.data(), nullptr, nullptr, FALSE, consoleFlags,
+                       nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi) == FALSE) {
         const DWORD code = GetLastError();
         if (errorCode != nullptr) {
             *errorCode = code;

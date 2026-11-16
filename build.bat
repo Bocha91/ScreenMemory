@@ -66,7 +66,7 @@ cl /nologo /W4 /std:c++17 /EHsc /O2 /MT /permissive- /utf-8 ^
    src\*.cpp "%OBJ%\app.res" ^
    /link /SUBSYSTEM:CONSOLE /MANIFEST:EMBED /MANIFESTINPUT:ScreenMemory.manifest ^
    user32.lib dwmapi.lib ole32.lib oleaut32.lib shell32.lib shlwapi.lib ^
-   psapi.lib propsys.lib advapi32.lib
+   psapi.lib propsys.lib advapi32.lib userenv.lib
 if errorlevel 1 (
     echo [build] ERROR: compilation failed.
     exit /b 1

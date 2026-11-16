@@ -24,6 +24,13 @@ void ClearProcessCache();
 // Опрос без кэша. false — процесс не открылся или путь не прочитан (см. error).
 bool ReadProcessInfo(DWORD pid, ProcessInfo* out);
 
+// Права процесса (PLAN.md §9.3): 1 — запущен от администратора, 0 — от обычного
+// пользователя, -1 — узнать не удалось (процесс закрылся, доступа нет).
+// Чужой повышенный процесс того же пользователя открывается через
+// PROCESS_QUERY_LIMITED_INFORMATION: UIPI запрещает окна и хуки, но не чтение токена.
+// Кэшируется на время запуска (как ProcessInfoFor): у приложения обычно несколько окон.
+int ProcessElevation(DWORD pid);
+
 // AppUserModelID окна (PKEY_AppUserModel_ID). У обычных Win32-приложений его
 // обычно нет; у UWP рамка ApplicationFrameWindow отдаёт AUMID приложения.
 std::wstring WindowAppUserModelId(HWND hwnd);
