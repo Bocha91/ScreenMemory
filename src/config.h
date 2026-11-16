@@ -24,6 +24,8 @@ struct Config {
     bool autoSaveSet = false;            // ключ AutoSave был в файле (для отчёта)
     int autoRestoreDelaySec = 30;        // ключ AutoRestoreDelay: задержка входа, секунды
     bool autoRestoreDelaySet = false;    // ключ AutoRestoreDelay был в файле (для отчёта)
+    int layoutVersions = 3;              // ключ Layouts: сколько рабочих версий слепка хранить
+    bool layoutVersionsSet = false;      // ключ Layouts был в файле (для отчёта)
     std::vector<std::wstring> unknownKeys;  // ключи, которых программа не знает (для --verbose)
 };
 

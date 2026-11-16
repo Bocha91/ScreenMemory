@@ -7,7 +7,8 @@
 
 // Файл раскладки bin\layout.txt (PLAN.md §6): INI-подобный текст UTF-8, секции
 // [desktop.N], [monitor.N], [window.N], строки «ключ=значение».
-// Запись атомарная (layout.new → layout.txt) с ротацией 5 предыдущих версий (§6.1).
+// Запись атомарная (layout.new → layout.txt), с ротацией рабочих версий и защищёнными
+// копиями «вчерашний день» / «прежняя конфигурация» (§6.1).
 namespace sm {
 
 struct LayoutMonitor {
@@ -92,15 +93,65 @@ bool SameLayoutContent(const Layout& a, const Layout& b);
 // выглядел необъяснимым.
 std::wstring LayoutDiffReason(const Layout& a, const Layout& b);
 
-// Запись слепка в dir\layout.txt по правилам PLAN.md §6.1:
-// layout.new → ротация текущего файла в layout-<время>.txt → замена → удаление
-// версий сверх 5. rotated — имя созданного файла ротации (пусто — предыдущего не было),
-// pruned — сколько старых версий удалено.
-bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, std::wstring* path,
-                     std::wstring* rotated, int* pruned, std::wstring* error);
+// Сколько рабочих версий слепка держится в bin по умолчанию (PLAN.md §6.1). Ключ Layouts
+// в Config.ini меняет это число, допустимо 1…kMaxLayoutVersions.
+constexpr int kDefaultLayoutVersions = 3;
+constexpr int kMaxLayoutVersions = 20;
+
+// Защищённые копии (PLAN.md §6.1). Имена начинаются с layout-, поэтому их видно рядом с
+// рабочими версиями, но чистка (PruneOldVersions) их не трогает: она удаляет только файлы
+// с меткой времени, а всё остальное из layout-*.txt остаётся навсегда.
+//   «цепочка дней» сдвигается restore при старте новой сессии,
+//   «прежняя конфигурация» сдвигается save при смене мониторов или набора десктопов.
+constexpr int kDayChainLength = 3;
+constexpr int kConfigChainLength = 3;
+extern const wchar_t* const kDayChainNames[kDayChainLength];
+extern const wchar_t* const kConfigChainNames[kConfigChainLength];
+
+// Итог записи слепка — для отчёта save.
+struct LayoutSaveResult {
+    std::wstring path;        // dir\layout.txt
+    std::wstring rotated;     // имя файла ротации (пусто — предыдущего слепка не было)
+    std::wstring configCopy;  // имя копии «прежняя конфигурация» (пусто — конфигурация та же)
+    int pruned = 0;           // сколько рабочих версий удалено чисткой
+};
+
+// Запись слепка в dir\layout.txt по правилам PLAN.md §6.1: layout.new → защищённая копия
+// при смене конфигурации → ротация в layout-<время>.txt → замена → чистка версий сверх
+// versions. previous — прежний слепок (nullptr, если прочитать его не удалось): по нему
+// решается, изменилась ли конфигурация мониторов и набор десктопов.
+bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, const Layout* previous,
+                     int versions, LayoutSaveResult* result, std::wstring* error);
 
 // Чтение dir\layout.txt (нужно restore, этап 6).
 bool ReadLayoutFile(const std::wstring& dir, Layout* out, std::wstring* path,
                     std::wstring* error);
+
+// Чтение раскладки из произвольного файла (restore --from): абсолютный путь — как есть,
+// иначе имя ищется рядом с exe. В path возвращается разобранный путь.
+bool ReadLayoutFromFile(const std::wstring& dir, const std::wstring& file, Layout* out,
+                        std::wstring* path, std::wstring* error);
+
+// Изменилась ли конфигурация: состав и геометрия мониторов (device, rect, primary) плюс
+// набор GUID десктопов. Имена десктопов и порядок мониторов изменением не считаются.
+bool SameConfigSignature(const Layout& a, const Layout& b);
+
+// Начало текущей загрузки системы в формате метки «2026-11-12T21:15:03» (местное время):
+// слепок с меньшей меткой принадлежит прошлой сессии. Пустая строка — время не узнать.
+std::wstring SessionStartStamp();
+
+// Сдвиг «цепочки дней» при старте сессии (PLAN.md §6.1 п.5): слепок, с которым
+// восстанавливаемся, становится «вчерашним», прежний «вчерашний» — «позавчерашним» и т. д.
+// Сдвига нет, если слепок создан в текущей сессии или уже стоит во «вчерашнем» — повторный
+// restore в тот же день цепочку не портит. Вызывает restore, не save.
+struct DayChainResult {
+    bool shifted = false;
+    std::wstring reason;     // почему не сдвигали (для --verbose)
+    std::wstring yesterday;  // имя файла «вчерашний день»
+    std::wstring previous;   // метка слепка, лежавшего там до сдвига (пусто — файла не было)
+};
+
+bool ShiftDayChain(const std::wstring& dir, const Layout& layout, DayChainResult* result,
+                   std::wstring* error);
 
 }  // namespace sm

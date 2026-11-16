@@ -23,6 +23,11 @@ constexpr int kMaxAutoSaveMinutes = 24 * 60;
 constexpr int kDefaultAutoRestoreDelaySec = 30;
 constexpr int kMaxAutoRestoreDelaySec = 60 * 60;
 
+// Сколько рабочих версий слепка держать в bin (PLAN.md §6.1, ключ Layouts). Значения те же,
+// что kDefaultLayoutVersions/kMaxLayoutVersions в storage.h: там они — для записи файла.
+constexpr int kDefaultLayoutVersions = 3;
+constexpr int kMaxLayoutVersions = 20;
+
 std::wstring Trim(const std::wstring& text) {
     const size_t first = text.find_first_not_of(L" \t\r\n");
     if (first == std::wstring::npos) {
@@ -282,6 +287,10 @@ bool LoadConfig(Config* config, std::wstring* error) {
                 ParseBounded(value, L"AutoRestoreDelay", kDefaultAutoRestoreDelaySec, 0,
                              kMaxAutoRestoreDelaySec);
             config->autoRestoreDelaySet = !value.empty();
+        } else if (key == L"layouts") {
+            config->layoutVersions = ParseBounded(value, L"Layouts", kDefaultLayoutVersions, 1,
+                                                  kMaxLayoutVersions);
+            config->layoutVersionsSet = !value.empty();
         } else if (!key.empty()) {
             config->unknownKeys.push_back(key);
         }

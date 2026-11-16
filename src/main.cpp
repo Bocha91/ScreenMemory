@@ -42,6 +42,7 @@ enum ExitCode {
 
 struct CommandLine {
     std::wstring command;  // "save" | "restore" | "autosave" | "autorestore" | "uninstall"
+    std::wstring from;     // ключ --from: файл, из которого восстанавливать (пусто — layout.txt)
     bool help = false;
     bool version = false;
     bool list = false;
@@ -60,6 +61,9 @@ void PrintUsage() {
     sm::Info(L"Использование:");
     sm::Info(L"  ScreenMemory.exe save        сохранить текущую раскладку окон в layout.txt");
     sm::Info(L"  ScreenMemory.exe restore     восстановить раскладку из layout.txt");
+    sm::Info(L"  ScreenMemory.exe restore --from <файл>");
+    sm::Info(L"                               восстановить из указанного файла (любой layout-*.txt:");
+    sm::Info(L"                               рабочая версия, «вчерашний день», «прежняя конфигурация»)");
     sm::Info(L"  ScreenMemory.exe AutoSave    поставить в Планировщик заданий сохранение каждые N мин");
     sm::Info(L"  ScreenMemory.exe AutoRestore поставить в Планировщик восстановление при входе в систему");
     sm::Info(L"  ScreenMemory.exe Uninstall   снять задачи AutoSave/AutoRestore и автозагрузку");
@@ -95,6 +99,8 @@ void PrintUsage() {
     sm::Info(L"  AutoSave=<минуты>             интервал задачи AutoSave (по умолчанию 10)");
     sm::Info(L"  AutoRestoreDelay=<сек>        задержка задачи AutoRestore после входа");
     sm::Info(L"                                (по умолчанию 30, 0 — без задержки)");
+    sm::Info(L"  Layouts=<число>               сколько рабочих версий слепка хранить");
+    sm::Info(L"                                (по умолчанию 3; защищённые копии не в счёт)");
     sm::Info(L"  save предварительный шаг не выполняет: он только записывает то,");
     sm::Info(L"  что видно сейчас.");
 }
@@ -474,6 +480,15 @@ sm::LayoutWindow MakeLayoutWindow(const sm::WindowInfo& info,
 int RunSave(const CommandLine& /*cl*/) {
     std::wstring error;
 
+    // Единственная настройка, которая нужна save, — сколько рабочих версий держать
+    // (ключ Layouts, PLAN.md §6.1). Сбой чтения Config.ini — не повод не сохранять слепок.
+    sm::Config config;
+    std::wstring configError;
+    if (!sm::LoadConfig(&config, &configError)) {
+        sm::Warn(L"Config.ini: %s — беру значения по умолчанию", configError.c_str());
+    }
+    sm::Trace(L"Config.ini: рабочих версий слепка %d", config.layoutVersions);
+
     // COM нужен для IVirtualDesktopManager: без него не узнать десктоп окна.
     if (!sm::InitCom(&error)) {
         sm::Error(L"%s", error.c_str());
@@ -573,7 +588,9 @@ int RunSave(const CommandLine& /*cl*/) {
     // ротация не крутится (иначе диск изнашивался бы впустую, PLAN.md §11).
     sm::Layout previous;
     std::wstring previousError;
+    bool previousOk = false;
     if (sm::ReadLayoutFile(sm::ExeDir(), &previous, nullptr, &previousError)) {
+        previousOk = true;
         const std::wstring reason = sm::LayoutDiffReason(previous, layout);
         if (reason.empty()) {
             sm::Info(L"Слепок не изменился с %s — файл не перезаписан", previous.saved.c_str());
@@ -589,15 +606,14 @@ int RunSave(const CommandLine& /*cl*/) {
         sm::Trace(L"прежний слепок не прочитан (%s) — пишу новый", previousError.c_str());
     }
 
-    std::wstring path;
-    std::wstring rotated;
-    int pruned = 0;
-    if (!sm::WriteLayoutFile(sm::ExeDir(), layout, &path, &rotated, &pruned, &error)) {
+    sm::LayoutSaveResult saved;
+    if (!sm::WriteLayoutFile(sm::ExeDir(), layout, previousOk ? &previous : nullptr,
+                             config.layoutVersions, &saved, &error)) {
         sm::Error(L"не удалось записать раскладку: %s", error.c_str());
         return kExitError;
     }
 
-    sm::Info(L"Слепок сохранён: %s", path.c_str());
+    sm::Info(L"Слепок сохранён: %s", saved.path.c_str());
     sm::Info(L"  десктопов %d, мониторов %d, окон %d (pinned %d)",
              static_cast<int>(layout.desktops.size()),
              static_cast<int>(layout.monitors.size()),
@@ -626,10 +642,16 @@ int RunSave(const CommandLine& /*cl*/) {
     if (browserCount > 0) {
         sm::Info(L"  браузеров %d, адрес страницы прочитан у %d", browserCount, browserWithUrl);
     }
+    // Смену конфигурации видно сразу: это не «ещё одна копия», а защищённый слепок, к
+    // которому потом возвращаются через restore --from (PLAN.md §6.1).
+    if (!saved.configCopy.empty()) {
+        sm::Info(L"  конфигурация мониторов/десктопов изменилась: прежний слепок — %s",
+                 saved.configCopy.c_str());
+    }
     // Ротация версий и число удалённых старых копий — всегда так, поэтому в отчёт не
     // выводим: место для ротации сообщает Trace, когда включён --verbose (CONTEXT п. 63).
     sm::Trace(L"  предыдущая версия: %s; старых версий удалено: %d",
-              rotated.empty() ? L"—" : rotated.c_str(), pruned);
+              saved.rotated.empty() ? L"—" : saved.rotated.c_str(), saved.pruned);
 
     // Самопроверка формата (--verbose): читаем только что записанный файл обратно.
     // Ловит расхождения записи и разбора (экранирование, «;» в заголовках, многострочные
@@ -820,10 +842,15 @@ int RunRestore(const CommandLine& cl) {
     std::wstring error;
     std::wstring path;
     sm::Layout layout;
-    if (!sm::ReadLayoutFile(sm::ExeDir(), &layout, &path, &error)) {
+    const bool fromFile = !cl.from.empty();
+    const bool read =
+        fromFile ? sm::ReadLayoutFromFile(sm::ExeDir(), cl.from, &layout, &path, &error)
+                 : sm::ReadLayoutFile(sm::ExeDir(), &layout, &path, &error);
+    if (!read) {
         sm::Error(L"%s", error.c_str());
-        sm::Info(L"подсказка: снять слепок заново — ScreenMemory.exe save; откатиться на "
-                 L"предыдущую версию — переименовать нужный layout-*.txt в layout.txt");
+        sm::Info(L"подсказка: снять слепок заново — ScreenMemory.exe save; восстановить из "
+                 L"другого файла — ScreenMemory.exe restore --from layout-<время>.txt "
+                 L"(есть ещё layout-вчерашний-день.txt и layout-прежняя-конфигурация.txt)");
         return kExitNoLayout;
     }
 
@@ -833,6 +860,27 @@ int RunRestore(const CommandLine& cl) {
              static_cast<int>(layout.windows.size()));
     if (cl.dryRun) {
         sm::Info(L"  режим --dry-run: окна не перемещаются, ничего не запускается");
+    }
+
+    // Цепочка дней (PLAN.md §6.1 п.5) двигается здесь, а не в save: «новая сессия» — это
+    // именно восстановление после загрузки. Слепок, с которым восстанавливаемся, становится
+    // «вчерашним», прежний «вчерашний» уезжает в «позавчерашний» и т. д. Второй и
+    // следующие restore в той же сессии цепочку не трогают: слепок либо снят уже после
+    // загрузки, либо уже стоит во «вчерашнем». С файлом --from цепочку не двигаем: это
+    // осознанный откат, а не начало нового дня.
+    if (!cl.dryRun && !fromFile) {
+        sm::DayChainResult chain;
+        std::wstring chainError;
+        if (!sm::ShiftDayChain(sm::ExeDir(), layout, &chain, &chainError)) {
+            sm::Warn(L"цепочка дней не сдвинута: %s", chainError.c_str());
+        } else if (chain.shifted) {
+            sm::Info(L"  цепочка дней сдвинута: %s ← слепок %s", chain.yesterday.c_str(),
+                     layout.saved.c_str());
+            sm::Trace(L"  прежде «вчерашним» был слепок %s",
+                      chain.previous.empty() ? L"—" : chain.previous.c_str());
+        } else {
+            sm::Trace(L"  цепочка дней: %s", chain.reason.c_str());
+        }
     }
     sm::Info(L"");
 
@@ -1747,6 +1795,22 @@ bool ParseCommandLine(int argc, wchar_t** argv, CommandLine* cl, std::wstring* e
             cl->dryRun = true;
         } else if (EqualsIgnoreCase(arg, L"--hidden")) {
             cl->hidden = true;
+        } else if (EqualsIgnoreCase(arg, L"--from") ||
+                   (arg.size() > 7 && _wcsnicmp(arg.c_str(), L"--from=", 7) == 0)) {
+            // Файл для restore: --from <файл> или --from=<файл>. Путь с пробелами cmd.exe
+            // отдаёт одним argv, кавычки уже сняты — дополнительно ничего не разбираем.
+            std::wstring value;
+            if (arg.size() > 7) {
+                value = arg.substr(7);
+            } else if (i + 1 < argc) {
+                value = argv[++i];
+            }
+            if (value.empty() || value[0] == L'-') {
+                *error = L"ключ --from требует имени файла, например "
+                         L"--from layout-вчерашний-день.txt";
+                return false;
+            }
+            cl->from = value;
         } else if (!arg.empty() && arg[0] == L'-') {
             *error = L"неизвестный ключ: " + arg;
             return false;
@@ -1783,6 +1847,10 @@ bool ParseCommandLine(int argc, wchar_t** argv, CommandLine* cl, std::wstring* e
     }
     if (cl->hidden && cl->command.empty()) {
         *error = L"ключ --hidden применяется только с командой";
+        return false;
+    }
+    if (!cl->from.empty() && !EqualsIgnoreCase(cl->command, L"restore")) {
+        *error = L"ключ --from применяется только с командой restore";
         return false;
     }
     return true;

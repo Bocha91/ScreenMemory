@@ -179,43 +179,54 @@ bool ReadUtf8File(const std::wstring& path, std::wstring* out, std::wstring* err
     return true;
 }
 
+// Метка из заголовка «# saved=2026-11-12T21:15:03» как есть — чтобы сравнивать слепки
+// между собой (так restore понимает, что перед ним тот же самый снимок). false — заголовка
+// нет или он битый.
+bool HeaderSavedOf(const std::wstring& path, std::wstring* stamp) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    char head[512] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, head, sizeof(head) - 1, &read, nullptr);
+    CloseHandle(file);
+    if (!ok) {
+        return false;
+    }
+    const std::string text(head, read);
+    const size_t pos = text.find("# saved=");
+    if (pos == std::string::npos || pos + 8 + 19 > text.size()) {
+        return false;
+    }
+    const std::string raw = text.substr(pos + 8, 19);
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        bool separator = false;
+        if (i == 4 || i == 7) {
+            separator = c == '-';
+        } else if (i == 10) {
+            separator = c == 'T';
+        } else if (i == 13 || i == 16) {
+            separator = c == ':';
+        }
+        if (!separator && (c < '0' || c > '9')) {
+            return false;
+        }
+    }
+    stamp->assign(raw.begin(), raw.end());
+    return true;
+}
+
 // Метка времени из заголовка «# saved=2026-11-12T21:15:03» — для имени файла
 // ротации. Если заголовка нет или он битый — берём время изменения файла.
 std::wstring SavedStampOf(const std::wstring& path) {
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        char head[512] = {};
-        DWORD read = 0;
-        const BOOL ok = ReadFile(file, head, sizeof(head) - 1, &read, nullptr);
-        CloseHandle(file);
-        if (ok) {
-            const std::string text(head, read);
-            const size_t pos = text.find("# saved=");
-            if (pos != std::string::npos && pos + 8 + 19 <= text.size()) {
-                std::string stamp = text.substr(pos + 8, 19);
-                bool valid = true;
-                for (size_t i = 0; i < stamp.size() && valid; ++i) {
-                    const char c = stamp[i];
-                    bool separator = false;
-                    if (i == 4 || i == 7) {
-                        separator = c == '-';
-                    } else if (i == 10) {
-                        separator = c == 'T';
-                    } else if (i == 13 || i == 16) {
-                        separator = c == ':';
-                    }
-                    if (!separator && (c < '0' || c > '9')) {
-                        valid = false;
-                    }
-                }
-                if (valid) {
-                    std::replace(stamp.begin(), stamp.end(), 'T', '_');
-                    std::replace(stamp.begin(), stamp.end(), ':', '-');
-                    return std::wstring(stamp.begin(), stamp.end());
-                }
-            }
-        }
+    std::wstring stamp;
+    if (HeaderSavedOf(path, &stamp)) {
+        std::replace(stamp.begin(), stamp.end(), L'T', L'_');
+        std::replace(stamp.begin(), stamp.end(), L':', L'-');
+        return stamp;
     }
 
     WIN32_FILE_ATTRIBUTE_DATA data{};
@@ -235,7 +246,49 @@ std::wstring RotatedPathFor(const std::wstring& dir, const std::wstring& stamp) 
     return path;
 }
 
-// Оставляем keep самых новых layout-*.txt, остальные удаляем (PLAN.md §6.1 п.4).
+// «layout-YYYY-MM-DD_HH-MM-SS.txt» (и «…-N.txt», если секунда была занята) — рабочая
+// версия. Всё остальное из layout-*.txt — защищённые копии («вчерашний день», «прежняя
+// конфигурация»): чистка их не трогает, иначе смысл защиты пропадает (PLAN.md §6.1).
+bool IsVersionName(const std::wstring& name) {
+    const std::wstring prefix = L"layout-";
+    const std::wstring suffix = L".txt";
+    if (name.size() < prefix.size() + 19 + suffix.size() ||
+        name.compare(0, prefix.size(), prefix) != 0 ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+    }
+    const std::wstring body =
+        name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    for (size_t i = 0; i < 19; ++i) {
+        const wchar_t c = body[i];
+        bool separator = false;
+        if (i == 4 || i == 7) {
+            separator = c == L'-';
+        } else if (i == 10) {
+            separator = c == L'_';
+        } else if (i == 13 || i == 16) {
+            separator = c == L'-';
+        }
+        if (!separator && (c < L'0' || c > L'9')) {
+            return false;
+        }
+    }
+    if (body.size() == 19) {
+        return true;
+    }
+    if (body[19] != L'-' || body.size() == 20) {
+        return false;
+    }
+    for (size_t i = 20; i < body.size(); ++i) {
+        if (body[i] < L'0' || body[i] > L'9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Оставляем keep самых новых рабочих версий layout-<время>.txt, остальные удаляем
+// (PLAN.md §6.1 п.4). Защищённые копии не считаются и не удаляются никогда.
 int PruneOldVersions(const std::wstring& dir, int keep) {
     struct Entry {
         std::wstring path;
@@ -252,6 +305,9 @@ int PruneOldVersions(const std::wstring& dir, int keep) {
     do {
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             continue;
+        }
+        if (!IsVersionName(data.cFileName)) {
+            continue;  // защищённая копия: не наша, не считаем и не удаляем
         }
         Entry entry;
         entry.path = JoinPath(dir, data.cFileName);
@@ -800,18 +856,76 @@ bool ParseLayout(const std::wstring& text, Layout* out, std::wstring* error) {
     return true;
 }
 
-bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, std::wstring* path,
-                     std::wstring* rotated, int* pruned, std::wstring* error) {
+namespace {
+
+// Продвинуть цепочку защищённых копий: последняя удаляется, каждая предыдущая
+// переименовывается на шаг вперёд, на освободившееся первое место копируется source.
+// previous — метка слепка, который лежал в первой копии до сдвига (для отчёта).
+bool PushChain(const std::wstring& dir, const wchar_t* const* names, int count,
+               const std::wstring& source, std::wstring* previous, std::wstring* error) {
+    if (previous != nullptr) {
+        previous->clear();
+        std::wstring stamp;
+        if (HeaderSavedOf(JoinPath(dir, names[0]), &stamp)) {
+            *previous = stamp;
+        }
+    }
+
+    if (count < 1) {
+        return true;
+    }
+    const std::wstring last = JoinPath(dir, names[count - 1]);
+    if (FileExists(last) && !DeleteFileW(last.c_str())) {
+        if (error != nullptr) {
+            *error = L"не удалось удалить " + last + L": " + Win32ErrorText(GetLastError());
+        }
+        return false;
+    }
+    for (int i = count - 1; i >= 1; --i) {
+        const std::wstring from = JoinPath(dir, names[i - 1]);
+        if (!FileExists(from)) {
+            continue;
+        }
+        const std::wstring to = JoinPath(dir, names[i]);
+        if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            if (error != nullptr) {
+                *error = L"не удалось переименовать " + from + L": " +
+                         Win32ErrorText(GetLastError());
+            }
+            return false;
+        }
+        Trace(L"цепочка: %s -> %s", from.c_str(), to.c_str());
+    }
+
+    const std::wstring first = JoinPath(dir, names[0]);
+    // CopyFile переносит на копию дату исходника: «вчерашний день» помечен временем
+    // слепка, а не временем сдвига — по нему и решается, что уже сдвинуто.
+    if (!CopyFileW(source.c_str(), first.c_str(), FALSE)) {
+        if (error != nullptr) {
+            *error = L"не удалось скопировать " + source + L" в " + first + L": " +
+                     Win32ErrorText(GetLastError());
+        }
+        return false;
+    }
+    Trace(L"цепочка: %s -> %s", source.c_str(), first.c_str());
+    return true;
+}
+
+}  // namespace
+
+bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, const Layout* previous,
+                     int versions, LayoutSaveResult* result, std::wstring* error) {
     const std::wstring finalPath = JoinPath(dir, L"layout.txt");
     const std::wstring tempPath = JoinPath(dir, L"layout.new");
-    if (path != nullptr) {
-        *path = finalPath;
+    if (result != nullptr) {
+        *result = LayoutSaveResult();
+        result->path = finalPath;
     }
-    if (rotated != nullptr) {
-        rotated->clear();
+    if (versions < 1) {
+        versions = kDefaultLayoutVersions;
     }
-    if (pruned != nullptr) {
-        *pruned = 0;
+    if (versions > kMaxLayoutVersions) {
+        versions = kMaxLayoutVersions;
     }
 
     // 1. Пишем во временный файл: даже если что-то упадёт между шагами,
@@ -820,13 +934,34 @@ bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, std::wstring
         return false;
     }
 
-    // 2. Предыдущий слепок — в файл ротации. Имя берём из его же заголовка
+    // 2. Изменились мониторы или набор десктопов — прежний слепок в защищённую копию.
+    //    Именно save замечает смену конфигурации (restore за это не отвечает): при
+    //    следующем запуске restore, когда мониторы уже починены, «как было при четырёх
+    //    мониторах» иначе было бы не восстановить. Копию делаем ДО ротации: после неё
+    //    layout.txt — это уже новый слепок. Три места в цепочке страхуют от случая, когда
+    //    «прежним» оказался слепок, снятый уже после сбоя.
+    if (FileExists(finalPath) && previous != nullptr && !SameConfigSignature(*previous, layout)) {
+        std::wstring copied;
+        std::wstring shiftError;
+        if (PushChain(dir, kConfigChainNames, kConfigChainLength, finalPath, &copied,
+                      &shiftError)) {
+            if (result != nullptr) {
+                result->configCopy = kConfigChainNames[0];
+            }
+            Trace(L"конфигурация изменилась: прежний слепок — в %s", kConfigChainNames[0]);
+        } else {
+            // Не фатально: свежий слепок важнее архивного.
+            Warn(L"копия «прежняя конфигурация» не создана: %s", shiftError.c_str());
+        }
+    }
+
+    // 3. Предыдущий слепок — в файл ротации. Имя берём из его же заголовка
     //    «# saved=», чтобы имя отражало время снимка, а не время переименования.
     if (FileExists(finalPath)) {
         const std::wstring target = RotatedPathFor(dir, SavedStampOf(finalPath));
         if (MoveFileExW(finalPath.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            if (rotated != nullptr) {
-                *rotated = FileNameOfPath(target);
+            if (result != nullptr) {
+                result->rotated = FileNameOfPath(target);
             }
             Trace(L"ротация: %s -> %s", finalPath.c_str(), target.c_str());
         } else {
@@ -836,7 +971,7 @@ bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, std::wstring
         }
     }
 
-    // 3. Атомарная замена: на NTFS MoveFileEx с REPLACE_EXISTING не теряет файл.
+    // 4. Атомарная замена: на NTFS MoveFileEx с REPLACE_EXISTING не теряет файл.
     if (!MoveFileExW(tempPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         if (error != nullptr) {
             *error = L"не удалось заменить layout.txt: " + Win32ErrorText(GetLastError());
@@ -845,30 +980,236 @@ bool WriteLayoutFile(const std::wstring& dir, const Layout& layout, std::wstring
         return false;
     }
 
-    // 4. Держим 5 предыдущих версий.
-    if (pruned != nullptr) {
-        *pruned = PruneOldVersions(dir, 5);
+    // 5. Держим versions рабочих версий; защищённые копии не считаются (PLAN.md §6.1).
+    const int pruned = PruneOldVersions(dir, versions);
+    if (result != nullptr) {
+        result->pruned = pruned;
     }
     return true;
 }
 
-bool ReadLayoutFile(const std::wstring& dir, Layout* out, std::wstring* path,
-                    std::wstring* error) {
-    const std::wstring file = JoinPath(dir, L"layout.txt");
-    if (path != nullptr) {
-        *path = file;
+namespace {
+
+// Путь из ключа --from: «C:\…», «\\сервер\…», «\каталог» — как есть, иначе рядом с exe.
+std::wstring ResolveFromPath(const std::wstring& dir, const std::wstring& file) {
+    if (file.size() >= 2 && (file[1] == L':' || (file[0] == L'\\' && file[1] == L'\\'))) {
+        return file;
     }
-    if (!FileExists(file)) {
+    if (!file.empty() && file[0] == L'\\') {
+        return file;
+    }
+    return JoinPath(dir, file);
+}
+
+// Начало текущей загрузки системы в местном времени. NtQuerySystemInformation
+// (SystemTimeOfDayInformation, класс 3) отдаёт точное время загрузки — оно не зависит ни
+// от сна, ни от перевода часов; «сейчас минус GetTickCount64» — запасной путь.
+std::wstring BootStampForSession() {
+    typedef LONG(NTAPI * NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
+    struct TimeOfDayInfo {
+        LARGE_INTEGER bootTime;  // системное время (UTC) в 100-нс единицах
+        LARGE_INTEGER currentTime;
+        LARGE_INTEGER timeZoneBias;
+        ULONG timeZoneId;
+        ULONG reserved;
+        ULONGLONG bootTimeBias;
+        ULONGLONG sleepTimeBias;
+    };
+
+    LARGE_INTEGER boot{};
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");  // ntdll загружен всегда
+    if (ntdll != nullptr) {
+        const auto query = reinterpret_cast<NtQuerySystemInformationFn>(
+            GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        TimeOfDayInfo info{};
+        if (query != nullptr &&
+            query(3 /* SystemTimeOfDayInformation */, &info, sizeof(info), nullptr) >= 0) {
+            boot = info.bootTime;
+        }
+    }
+    if (boot.QuadPart <= 0) {
+        FILETIME nowFileTime{};
+        GetSystemTimeAsFileTime(&nowFileTime);
+        ULARGE_INTEGER now{};
+        now.LowPart = nowFileTime.dwLowDateTime;
+        now.HighPart = nowFileTime.dwHighDateTime;
+        const ULONGLONG worked = GetTickCount64() * 10000ULL;  // мс → 100-нс
+        if (now.QuadPart <= worked) {
+            return std::wstring();
+        }
+        boot.QuadPart = static_cast<LONGLONG>(now.QuadPart - worked);
+    }
+
+    FILETIME utc{};
+    utc.dwLowDateTime = static_cast<DWORD>(static_cast<ULONGLONG>(boot.QuadPart) & 0xFFFFFFFFULL);
+    utc.dwHighDateTime = static_cast<DWORD>(static_cast<ULONGLONG>(boot.QuadPart) >> 32);
+    SYSTEMTIME utcTime{};
+    if (!FileTimeToSystemTime(&utc, &utcTime)) {
+        return std::wstring();
+    }
+    SYSTEMTIME localTime{};
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &utcTime, &localTime)) {
+        localTime = utcTime;
+    }
+    wchar_t text[32] = {};
+    swprintf_s(text, L"%04d-%02d-%02dT%02d:%02d:%02d", localTime.wYear, localTime.wMonth,
+               localTime.wDay, localTime.wHour, localTime.wMinute, localTime.wSecond);
+    return text;
+}
+
+// GUID в текст: для сравнения набора десктопов годится любой стабильный вид.
+std::wstring GuidText(const GUID& guid) {
+    wchar_t text[64] = {};
+    swprintf_s(text, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+               static_cast<unsigned long>(guid.Data1), guid.Data2, guid.Data3, guid.Data4[0],
+               guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5],
+               guid.Data4[6], guid.Data4[7]);
+    return text;
+}
+
+// Порядок мониторов у EnumDisplayMonitors не гарантирован — сравниваем как множество.
+bool MonitorLess(const LayoutMonitor& a, const LayoutMonitor& b) {
+    if (a.device != b.device) {
+        return a.device < b.device;
+    }
+    if (a.rect.left != b.rect.left) {
+        return a.rect.left < b.rect.left;
+    }
+    if (a.rect.top != b.rect.top) {
+        return a.rect.top < b.rect.top;
+    }
+    if (a.rect.right != b.rect.right) {
+        return a.rect.right < b.rect.right;
+    }
+    if (a.rect.bottom != b.rect.bottom) {
+        return a.rect.bottom < b.rect.bottom;
+    }
+    return a.primary < b.primary;
+}
+
+}  // namespace
+
+std::wstring SessionStartStamp() {
+    return BootStampForSession();
+}
+
+const wchar_t* const kDayChainNames[kDayChainLength] = {
+    L"layout-вчерашний-день.txt",
+    L"layout-позавчерашний-день.txt",
+    L"layout-позапозавчерашний-день.txt",
+};
+
+const wchar_t* const kConfigChainNames[kConfigChainLength] = {
+    L"layout-прежняя-конфигурация.txt",
+    L"layout-прежняя-конфигурация-2.txt",
+    L"layout-прежняя-конфигурация-3.txt",
+};
+
+bool ReadLayoutFromFile(const std::wstring& dir, const std::wstring& file, Layout* out,
+                        std::wstring* path, std::wstring* error) {
+    const std::wstring resolved = ResolveFromPath(dir, file);
+    if (path != nullptr) {
+        *path = resolved;
+    }
+    if (!FileExists(resolved)) {
         if (error != nullptr) {
-            *error = L"файл раскладки не найден: " + file;
+            *error = L"файл раскладки не найден: " + resolved;
         }
         return false;
     }
     std::wstring text;
-    if (!ReadUtf8File(file, &text, error)) {
+    if (!ReadUtf8File(resolved, &text, error)) {
         return false;
     }
     return ParseLayout(text, out, error);
+}
+
+bool ReadLayoutFile(const std::wstring& dir, Layout* out, std::wstring* path,
+                    std::wstring* error) {
+    return ReadLayoutFromFile(dir, L"layout.txt", out, path, error);
+}
+
+bool SameConfigSignature(const Layout& a, const Layout& b) {
+    if (a.monitors.size() != b.monitors.size() || a.desktops.size() != b.desktops.size()) {
+        return false;
+    }
+
+    std::vector<LayoutMonitor> left = a.monitors;
+    std::vector<LayoutMonitor> right = b.monitors;
+    std::sort(left.begin(), left.end(), MonitorLess);
+    std::sort(right.begin(), right.end(), MonitorLess);
+    for (size_t i = 0; i < left.size(); ++i) {
+        if (left[i].device != right[i].device || left[i].primary != right[i].primary ||
+            left[i].rect.left != right[i].rect.left || left[i].rect.top != right[i].rect.top ||
+            left[i].rect.right != right[i].rect.right ||
+            left[i].rect.bottom != right[i].rect.bottom) {
+            return false;
+        }
+    }
+
+    // Десктопы: важен набор GUID. Порядок и имена — нет: десктоп можно переименовать,
+    // и это не повод считать конфигурацию другой.
+    std::vector<std::wstring> leftGuids;
+    std::vector<std::wstring> rightGuids;
+    leftGuids.reserve(a.desktops.size());
+    rightGuids.reserve(b.desktops.size());
+    for (const LayoutDesktop& item : a.desktops) {
+        leftGuids.push_back(GuidText(item.guid));
+    }
+    for (const LayoutDesktop& item : b.desktops) {
+        rightGuids.push_back(GuidText(item.guid));
+    }
+    std::sort(leftGuids.begin(), leftGuids.end());
+    std::sort(rightGuids.begin(), rightGuids.end());
+    return leftGuids == rightGuids;
+}
+
+bool ShiftDayChain(const std::wstring& dir, const Layout& layout, DayChainResult* result,
+                   std::wstring* error) {
+    if (result != nullptr) {
+        *result = DayChainResult();
+        result->yesterday = kDayChainNames[0];
+    }
+    const std::wstring source = JoinPath(dir, L"layout.txt");
+    if (!FileExists(source)) {
+        if (result != nullptr) {
+            result->reason = L"нет layout.txt";
+        }
+        return true;
+    }
+
+    // Тот же слепок уже стоит «вчерашним» — сдвигать нечего. Без этой проверки каждый
+    // ручной restore съедал бы по одному звену цепочки, и от истории не осталось бы
+    // ничего за три запуска.
+    std::wstring yesterdayStamp;
+    if (HeaderSavedOf(JoinPath(dir, kDayChainNames[0]), &yesterdayStamp) &&
+        !layout.saved.empty() && yesterdayStamp == layout.saved) {
+        if (result != nullptr) {
+            result->reason = L"слепок уже стоит во «вчерашнем дне»";
+        }
+        return true;
+    }
+
+    // Слепок снят после загрузки системы — значит, перезагрузки не было и это середина
+    // текущей сессии: цепочку дней двигать не за что (PLAN.md §6.1 п.5).
+    const std::wstring sessionStart = SessionStartStamp();
+    if (!sessionStart.empty() && !layout.saved.empty() && layout.saved >= sessionStart) {
+        if (result != nullptr) {
+            result->reason = L"слепок снят в текущей сессии (" + layout.saved +
+                             L" не раньше загрузки " + sessionStart + L")";
+        }
+        return true;
+    }
+
+    std::wstring previous;
+    if (!PushChain(dir, kDayChainNames, kDayChainLength, source, &previous, error)) {
+        return false;
+    }
+    if (result != nullptr) {
+        result->shifted = true;
+        result->previous = previous;
+    }
+    return true;
 }
 
 }  // namespace sm
