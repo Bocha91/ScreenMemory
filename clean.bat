@@ -14,6 +14,10 @@ if exist "T:\ScreenMemory\obj" (
     del /q "T:\ScreenMemory\obj\*.*" >nul 2>&1
     echo [clean] cleared T:\ScreenMemory\obj
 )
+if exist "%TEMP%\ScreenMemory\obj" (
+    del /q "%TEMP%\ScreenMemory\obj\*.*" >nul 2>&1
+    echo [clean] cleared %TEMP%\ScreenMemory\obj
+)
 
 echo [clean] done
 exit /b 0

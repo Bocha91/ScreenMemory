@@ -34,6 +34,10 @@ build.bat        собирает bin\ScreenMemory.exe (объектники —
 clean.bat        удаляет exe и объектники
 ```
 
+Объектники и PDB пишутся на RAM-диск (`T:\ScreenMemory\obj` — меньше износ SSD). Если диска `T:`
+нет (не смонтирован, буква занята), `build.bat` печатает предупреждение и берёт
+`%TEMP%\ScreenMemory\obj`, то есть сборка не падает.
+
 Первый запуск `build.bat` дополнительно генерирует иконки `bin\save.ico` и `bin\restore.ico`
 через `tools\make_icons.ps1` (System.Drawing, ничего устанавливать не нужно).
 

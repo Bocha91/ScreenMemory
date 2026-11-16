@@ -31,10 +31,18 @@ if errorlevel 1 (
 rem --- 3. Directories ----------------------------------------------------------
 set "OBJ=T:\ScreenMemory\obj"
 if not exist "%OBJ%" mkdir "%OBJ%" >nul 2>&1
+if exist "%OBJ%" goto :obj_ready
+rem RAM disk T: is missing (not mounted / drive letter changed): fall back to %TEMP%
+rem so the build still works. Objects are disposable, this path costs nothing.
+set "OBJ=%TEMP%\ScreenMemory\obj"
+if not exist "%OBJ%" mkdir "%OBJ%" >nul 2>&1
 if not exist "%OBJ%" (
-    echo [build] ERROR: cannot create "%OBJ%". Check RAM disk T:.
+    echo [build] ERROR: cannot create object directory "%OBJ%".
     exit /b 1
 )
+echo [build] WARNING: RAM disk T: is not available, objects go to "%OBJ%"
+:obj_ready
+echo [build] objects: %OBJ%
 if not exist "bin" mkdir "bin"
 
 rem --- 4. Icons (generated once) -----------------------------------------------
