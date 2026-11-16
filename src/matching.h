@@ -92,6 +92,24 @@ void MatchWindows(const Layout& layout, const std::vector<WindowInfo>& live,
                   const std::vector<DesktopInfo>& currentDesktops,
                   std::vector<WindowMatch>* matches, MatchStats* stats = nullptr);
 
+// Перепроверка перед запуском (PLAN.md §8.3 п.0, CONTEXT п. 69). Пока restore работает,
+// окна открывает не только он: Windows возвращает окна Проводника (`PersistBrowsers=1`),
+// приложения из автозагрузки, браузер — сессию профиля. Снимок для фазы A делается один
+// раз, и запись, чьё окно появилось позже, осталась бы без пары — фаза B запустила бы
+// вторую копию (дубль). MatchRecord отвечает на вопрос «подошло ли этой записи какое-то
+// из ещё не занятых живых окон».
+//
+// Правила те же, что у MatchWindows (таблица §8.1, вето по folder/aumid/url, порог
+// принятия, правило неоднозначности): меняется только набор участников — одна запись и
+// окна, которые пока ничьи (liveTaken[i] != 0 — окно уже занято сопоставлением фазы A,
+// запуском или прошлой перепроверкой). Индексы в live — исходные, по всему вектору.
+// true — пара найдена; match->saved = recordIndex, match->live = индекс в live.
+bool MatchRecord(int recordIndex, const Layout& layout, const std::vector<WindowInfo>& live,
+                 const std::vector<char>& liveTaken,
+                 const std::vector<DesktopTarget>& targets,
+                 const std::vector<GUID>& liveDesktop,
+                 const std::vector<DesktopInfo>& currentDesktops, WindowMatch* match);
+
 // Целевой прямоугольник окна (PLAN.md §8.4): mrel от монитора-якоря; если монитор
 // отключён — абсолютные rect, если они попадают на живой монитор; иначе primary с
 // сохранением относительной позиции. Учитывает смену DPI и не даёт окну оказаться

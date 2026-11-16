@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -101,6 +102,8 @@ void PrintUsage() {
     sm::Info(L"                                (по умолчанию 30, 0 — без задержки)");
     sm::Info(L"  Layouts=<число>               сколько рабочих версий слепка хранить");
     sm::Info(L"                                (по умолчанию 3; защищённые копии не в счёт)");
+    sm::Info(L"  settle-wait=<сек>             сколько ждать «успокоения» окон перед");
+    sm::Info(L"                                запуском (по умолчанию 10, 0 — не ждать)");
     sm::Info(L"  save предварительный шаг не выполняет: он только записывает то,");
     sm::Info(L"  что видно сейчас.");
 }
@@ -840,6 +843,17 @@ void PrintDesktopMap(const sm::Layout& layout, const std::vector<sm::DesktopTarg
 
 int RunRestore(const CommandLine& cl) {
     std::wstring error;
+
+    // Настройка, которая нужна restore, — settle-wait (PLAN.md §8.3 п.0): сколько ждать
+    // «успокоения» окон, которые система и браузеры восстанавливают сами. Сбой чтения
+    // Config.ini — не повод не восстанавливать раскладку: работаем со значением по умолчанию.
+    sm::Config config;
+    std::wstring configError;
+    if (!sm::LoadConfig(&config, &configError)) {
+        sm::Warn(L"Config.ini: %s — беру значения по умолчанию", configError.c_str());
+    }
+    sm::Trace(L"Config.ini: settle-wait=%d с", config.settleWaitSec);
+
     std::wstring path;
     sm::Layout layout;
     const bool fromFile = !cl.from.empty();
@@ -1187,6 +1201,123 @@ int RunRestore(const CommandLine& cl) {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Перепроверка «окно могло открыться само» (PLAN.md §8.3 п.0, CONTEXT п. 69).
+    //
+    // Снимок окон для фазы A снят один раз. Но после входа в систему окна открывает не
+    // только restore: Windows возвращает окна Проводника (`PersistBrowsers=1` —
+    // «Восстанавливать прежние окна папок при входе») и приложения из автозагрузки,
+    // браузер — сессию профиля («Продолжить с того же места»). Это идёт в те же секунды,
+    // что и восстановление раскладки: на прогоне 16.11.2026 в снимке фазы A было 33 окна,
+    // а через минуту — 72, и часть адресов Chrome открыл сам, пока фаза B открывала их же.
+    // Дубль получается так: в фазе A окна записи ещё не было (пара не создана), фаза B
+    // запускает приложение, а через секунду его окно появляется само.
+    //
+    // Поэтому перед каждым запуском окна снимаются заново, а запись до-сопоставляется с
+    // окнами, которые ещё ничьи (те же правила, что в фазе A). Найденное окно просто
+    // ставится на место — второй экземпляр приложения не запускается.
+    std::vector<HWND> takenWindows;
+    takenWindows.reserve(matches.size());
+    for (const sm::WindowMatch& match : matches) {
+        takenWindows.push_back(live[match.live].hwnd);
+    }
+    // Занято ли окно: сопоставлено в фазе A, запущено или найдено перепроверкой.
+    const auto isWindowTaken = [&takenWindows](HWND hwnd) {
+        return std::find(takenWindows.begin(), takenWindows.end(), hwnd) != takenWindows.end();
+    };
+
+    // Адрес страницы живого окна читается через UIA — это межпроцессные вызовы, повторять
+    // их для окна, у которого адрес уже есть, незачем. Пустой адрес повторяем (страница
+    // могла ещё грузиться), но не бесконечно: три попытки на окно.
+    struct UrlCacheEntry {
+        std::wstring url;
+        int attempts = 0;
+    };
+    std::map<HWND, UrlCacheEntry> urlCache;
+    for (const sm::WindowInfo& info : live) {
+        if (!info.url.empty()) {
+            urlCache[info.hwnd] = UrlCacheEntry{info.url, 1};
+        }
+    }
+
+    // Снимок живых окон «прямо сейчас»: сведения о процессе, десктоп, адрес страницы.
+    // false — перечислить окна не удалось (перепроверка тогда просто ничего не находит).
+    const auto captureWindows = [&vdm, &urlCache](std::vector<sm::WindowInfo>* windows,
+                                                  std::vector<GUID>* windowDesktops) {
+        windows->clear();
+        windowDesktops->clear();
+        sm::WindowEnumStats snapshot;
+        if (!sm::CollectWindows(windows, &snapshot)) {
+            return false;
+        }
+        windowDesktops->assign(windows->size(), GUID{});
+        for (size_t i = 0; i < windows->size(); ++i) {
+            sm::WindowInfo& info = (*windows)[i];
+            if (vdm.ok()) {
+                GUID guid{};
+                if (vdm.GetWindowDesktopId(info.hwnd, &guid, false)) {
+                    (*windowDesktops)[i] = guid;
+                }
+            }
+            if (!sm::IsBrowserExe(info.exeName)) {
+                continue;
+            }
+            const auto cached = urlCache.find(info.hwnd);
+            if (cached != urlCache.end() &&
+                (!cached->second.url.empty() || cached->second.attempts >= 3)) {
+                info.url = cached->second.url;
+                continue;
+            }
+            UrlCacheEntry entry;
+            entry.url = sm::ReadBrowserUrl(info.hwnd);
+            entry.attempts = (cached != urlCache.end()) ? cached->second.attempts + 1 : 1;
+            urlCache[info.hwnd] = entry;
+            info.url = entry.url;
+        }
+        return true;
+    };
+
+    // Перепроверка одной записи: HWND подходящего живого окна либо nullptr. Окно здесь
+    // только ищется — на место его ставит общий код фазы B (счётчики и строки отчёта
+    // должны быть одни и те же).
+    const auto recheckRecord = [&](int recordIndex) -> HWND {
+        const sm::LayoutWindow& record = layout.windows[static_cast<size_t>(recordIndex)];
+        std::vector<sm::WindowInfo> fresh;
+        std::vector<GUID> freshDesktops;
+        std::vector<char> taken;
+        // У браузерной записи адрес страницы — главный признак содержимого окна. Если у
+        // кого-то из ещё не занятых окон браузера адрес не прочитан, сопоставление
+        // рискует прилепить запись к чужому окну (exe + class дают 150 при пороге 100),
+        // поэтому даём окнам ещё пару попыток: UIA мог не успеть, страница могла грузиться.
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (!captureWindows(&fresh, &freshDesktops)) {
+                return nullptr;
+            }
+            taken.assign(fresh.size(), 0);
+            bool unknownBrowserUrl = false;
+            for (size_t i = 0; i < fresh.size(); ++i) {
+                taken[i] = isWindowTaken(fresh[i].hwnd) ? 1 : 0;
+                if (taken[i] == 0 && !record.url.empty() && fresh[i].url.empty() &&
+                    sm::IsBrowserExe(fresh[i].exeName)) {
+                    unknownBrowserUrl = true;
+                }
+            }
+            if (!unknownBrowserUrl) {
+                break;
+            }
+            Sleep(500);
+        }
+        sm::WindowMatch found;
+        if (!sm::MatchRecord(recordIndex, layout, fresh, taken, targets, freshDesktops, desktops,
+                             &found)) {
+            return nullptr;
+        }
+        const sm::WindowInfo& info = fresh[static_cast<size_t>(found.live)];
+        sm::Trace(L"  перепроверка: «%s» уже открыто (%d б.: %s) — запускать не нужно",
+                  info.title.c_str(), found.score, found.why.c_str());
+        return info.hwnd;
+    };
+
     // Фаза B (PLAN.md §8.3): поднять приложения, окон которых нет. Консоли не
     // перезапускаем (§9.4: неизвестно, что в них было запущено) — такие записи
     // уходят в admin.log как ручная работа.
@@ -1207,6 +1338,64 @@ int RunRestore(const CommandLine& cl) {
         }
     }
 
+    // Ожидание «успокоения» перед запуском приложений (PLAN.md §8.3 п.0, CONTEXT п. 69):
+    // снимок фазы A сделан раньше, а Windows (окна папок, приложения из автозагрузки) и
+    // браузер (сессия профиля) продолжают открывать окна. Пока состав окон меняется,
+    // запускать приложения нельзя — получится дубль. Ждём тишины (2 с без изменений), но
+    // не дольше settle-wait секунд: если система «сыплет» окнами бесконечно, работаем по
+    // перепроверке перед каждым запуском. dry-run ничего не ждёт: он ничего не меняет.
+    int settleWaitedMs = 0;
+    {
+        bool anyToLaunch = false;
+        for (size_t i = 0; i < layout.windows.size(); ++i) {
+            if (matched[i] != 0) {
+                continue;
+            }
+            const sm::LaunchPlan plan = sm::PlanLaunch(layout.windows[i]);
+            if (plan.kind != sm::LaunchKind::None && plan.skipReason.empty()) {
+                anyToLaunch = true;
+                break;
+            }
+        }
+        const int settleLimitMs = cl.dryRun ? 0 : config.settleWaitSec * 1000;
+        const int kSettleStepMs = 500;
+        const int kSettleQuietMs = 2000;
+        if (anyToLaunch && settleLimitMs > 0) {
+            std::vector<HWND> previous;
+            previous.reserve(live.size());
+            for (const sm::WindowInfo& info : live) {
+                previous.push_back(info.hwnd);
+            }
+            std::sort(previous.begin(), previous.end());
+            int quietMs = 0;
+            while (settleWaitedMs < settleLimitMs && quietMs < kSettleQuietMs) {
+                Sleep(kSettleStepMs);
+                settleWaitedMs += kSettleStepMs;
+                std::vector<sm::WindowInfo> now;
+                std::vector<GUID> nowDesktops;
+                if (!captureWindows(&now, &nowDesktops)) {
+                    break;
+                }
+                std::vector<HWND> current;
+                current.reserve(now.size());
+                for (const sm::WindowInfo& info : now) {
+                    current.push_back(info.hwnd);
+                }
+                std::sort(current.begin(), current.end());
+                if (current == previous) {
+                    quietMs += kSettleStepMs;
+                    continue;
+                }
+                sm::Trace(L"  ожидание: окон стало %d (было %d) — состав ещё меняется",
+                          static_cast<int>(current.size()), static_cast<int>(previous.size()));
+                previous.swap(current);
+                quietMs = 0;
+            }
+            sm::Trace(L"  окна «успокоились»: ждали %.1f с",
+                      static_cast<double>(settleWaitedMs) / 1000.0);
+        }
+    }
+
     // Ожидание окна запущенного приложения. Время не критично, качество важнее
     // (требование пользователя): приложения медлят с открытием окон, поэтому ждём
     // до 60 с, а не 20. Досрочно прекращаем только если процесс завершился —
@@ -1223,6 +1412,8 @@ int RunRestore(const CommandLine& cl) {
     int launchFailed = 0;
     int launchSkipped = 0;
     int wouldLaunch = 0;
+    // Окна, которые открылись сами (перепроверка перед запуском): запускать не понадобилось.
+    int foundOpen = 0;
 
     for (size_t i = 0; i < layout.windows.size(); ++i) {
         if (matched[i] != 0) {
@@ -1289,6 +1480,37 @@ int RunRestore(const CommandLine& cl) {
             // В отчёте строка усечена до ширины экрана — полный текст плана нужен,
             // когда проверяешь, какой именно адрес/команда возьмётся при запуске.
             sm::Trace(L"  план запуска: %s", plan.text.c_str());
+            continue;
+        }
+
+        // Перепроверка перед запуском (PLAN.md §8.3 п.0, CONTEXT п. 69): пока шла работа,
+        // окно могло открыться само — система возвращает окна папок и приложения из
+        // автозагрузки, браузер восстанавливает сессию профиля. Второй экземпляр тогда не
+        // запускаем: найденное окно ставится на место по тем же правилам, что в фазе A.
+        const HWND alreadyOpen = recheckRecord(static_cast<int>(i));
+        if (alreadyOpen != nullptr) {
+            if (saved.pinned == 0 && target.kind == sm::DesktopMatchKind::Fallback) {
+                rememberFallback(alreadyOpen, target);
+            }
+            bool moved = false;
+            std::wstring applyProblem;
+            if (!ApplyMatch(saved, alreadyOpen, rect, sm::ShowCommandFor(saved.show), target, vdm,
+                            &moved, &applyProblem)) {
+                ++failed;
+                sm::Warn(L"«%s»: %s", saved.title.c_str(), applyProblem.c_str());
+                sm::AddAdminEntry(AdminReasonForProblem(applyProblem), sm::AdminCommand(saved));
+                takenWindows.push_back(alreadyOpen);
+                knownWindows.push_back(alreadyOpen);
+                continue;
+            }
+            ++foundOpen;
+            takenWindows.push_back(alreadyOpen);
+            knownWindows.push_back(alreadyOpen);
+            zOrderWindows.push_back(alreadyOpen);
+            zOrderZg.push_back(saved.zg);
+            sm::Info(L"  уже открыто: %-40s → %s  стол [%d] %s%s", FitText(saved.title, 40).c_str(),
+                     sm::RectToText(rect).c_str(), target.currentIndex,
+                     DesktopNameOrStub(target.currentName).c_str(), moved ? L", перенесено" : L"");
             continue;
         }
 
@@ -1388,6 +1610,7 @@ int RunRestore(const CommandLine& cl) {
         }
         ++launched;
         knownWindows.push_back(hwnd);  // окно занято: другое приложение его не возьмёт
+        takenWindows.push_back(hwnd);
         zOrderWindows.push_back(hwnd);
         zOrderZg.push_back(saved.zg);
         sm::Info(L"  запущено: %-40s → %s  стол [%d] %s%s", FitText(saved.title, 40).c_str(),
@@ -1455,6 +1678,9 @@ int RunRestore(const CommandLine& cl) {
     } else {
         sm::Info(L"Применено: %d, перенесено на другой десктоп: %d, z-order выставлен: %d", applied,
                  movedToDesktop, static_cast<int>(zOrderWindows.size()));
+        if (foundOpen > 0) {
+            sm::Info(L"Уже было открыто (запускать не понадобилось): %d", foundOpen);
+        }
         if (launched > 0 || launchFailed > 0 || launchSkipped > 0) {
             sm::Info(L"Запущено: %d, не удалось поднять: %d, не запускается: %d", launched,
                      launchFailed, launchSkipped);

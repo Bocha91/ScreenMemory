@@ -26,6 +26,11 @@ struct Config {
     bool autoRestoreDelaySet = false;    // ключ AutoRestoreDelay был в файле (для отчёта)
     int layoutVersions = 3;              // ключ Layouts: сколько рабочих версий слепка хранить
     bool layoutVersionsSet = false;      // ключ Layouts был в файле (для отчёта)
+    // Ключ settle-wait: сколько секунд ждать «успокоения» окон перед фазой B (запуск
+    // приложений) и сколько максимум ждать появления окна, которое система открывает сама
+    // (CONTEXT п. 69). 0 — не ждать вовсе.
+    int settleWaitSec = 10;
+    bool settleWaitSet = false;          // ключ settle-wait был в файле (для отчёта)
     std::vector<std::wstring> unknownKeys;  // ключи, которых программа не знает (для --verbose)
 };
 

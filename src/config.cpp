@@ -28,6 +28,10 @@ constexpr int kMaxAutoRestoreDelaySec = 60 * 60;
 constexpr int kDefaultLayoutVersions = 3;
 constexpr int kMaxLayoutVersions = 20;
 
+// Ожидание «успокоения» окон перед запуском приложений (ключ settle-wait, PLAN.md §8.3 п.0).
+constexpr int kDefaultSettleWaitSec = 10;
+constexpr int kMaxSettleWaitSec = 10 * 60;
+
 std::wstring Trim(const std::wstring& text) {
     const size_t first = text.find_first_not_of(L" \t\r\n");
     if (first == std::wstring::npos) {
@@ -291,6 +295,10 @@ bool LoadConfig(Config* config, std::wstring* error) {
             config->layoutVersions = ParseBounded(value, L"Layouts", kDefaultLayoutVersions, 1,
                                                   kMaxLayoutVersions);
             config->layoutVersionsSet = !value.empty();
+        } else if (key == L"settle-wait") {
+            config->settleWaitSec = ParseBounded(value, L"settle-wait", kDefaultSettleWaitSec, 0,
+                                                 kMaxSettleWaitSec);
+            config->settleWaitSet = !value.empty();
         } else if (!key.empty()) {
             config->unknownKeys.push_back(key);
         }

@@ -431,6 +431,59 @@ void MatchWindows(const Layout& layout, const std::vector<WindowInfo>& live,
     }
 }
 
+// Перепроверка перед запуском (PLAN.md §8.3 п.0, CONTEXT п. 69): одна запись против окон,
+// которые ещё ничьи. Участники урезаются до подмножества, а правила остаются прежними —
+// поэтому решение совпадает с тем, что приняла бы фаза A, если бы окно существовало тогда.
+bool MatchRecord(int recordIndex, const Layout& layout, const std::vector<WindowInfo>& live,
+                 const std::vector<char>& liveTaken,
+                 const std::vector<DesktopTarget>& targets,
+                 const std::vector<GUID>& liveDesktop,
+                 const std::vector<DesktopInfo>& currentDesktops, WindowMatch* match) {
+    if (match == nullptr || recordIndex < 0 ||
+        recordIndex >= static_cast<int>(layout.windows.size())) {
+        return false;
+    }
+
+    // Подмножество записей: только эта. Десктопы и мониторы — как в слепке целиком:
+    // DesktopSlot ищет десктоп записи именно по ним.
+    Layout subset;
+    subset.saved = layout.saved;
+    subset.screenW = layout.screenW;
+    subset.screenH = layout.screenH;
+    subset.desktops = layout.desktops;
+    subset.monitors = layout.monitors;
+    subset.windows.push_back(layout.windows[static_cast<size_t>(recordIndex)]);
+
+    // Подмножество окон: всё, что ещё не занято. Индексы переводим обратно, чтобы
+    // вызывающий работал с исходным вектором живых окон.
+    std::vector<WindowInfo> liveSubset;
+    std::vector<GUID> liveDesktopSubset;
+    std::vector<int> liveIndex;
+    for (size_t i = 0; i < live.size(); ++i) {
+        if (i < liveTaken.size() && liveTaken[i] != 0) {
+            continue;
+        }
+        liveSubset.push_back(live[i]);
+        liveDesktopSubset.push_back(i < liveDesktop.size() ? liveDesktop[i] : GUID{});
+        liveIndex.push_back(static_cast<int>(i));
+    }
+    if (liveSubset.empty()) {
+        return false;
+    }
+
+    std::vector<WindowMatch> found;
+    MatchWindows(subset, liveSubset, targets, liveDesktopSubset, currentDesktops, &found, nullptr);
+    if (found.empty()) {
+        return false;
+    }
+    const WindowMatch& best = found.front();
+    match->saved = recordIndex;
+    match->live = liveIndex[static_cast<size_t>(best.live)];
+    match->score = best.score;
+    match->why = best.why;
+    return true;
+}
+
 namespace {
 
 void AddNote(std::wstring* note, const wchar_t* what) {
