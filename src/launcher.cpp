@@ -223,6 +223,11 @@ bool EnablePrivilege(const wchar_t* name) {
         privileges.PrivilegeCount = 1;
         privileges.Privileges[0].Luid = luid;
         privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        // AdjustTokenPrivileges возвращает TRUE и при ERROR_NOT_ALL_ASSIGNED (привилегии нет
+        // в токене), поэтому успех проверяется по GetLastError — и перед вызовом её нужно
+        // обнулить, иначе код вернёт чужую ошибку и журнал скажет, что привилегии не
+        // включились, хотя они включены.
+        SetLastError(ERROR_SUCCESS);
         ok = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr,
                                    nullptr) != FALSE &&
              GetLastError() == ERROR_SUCCESS;
@@ -330,15 +335,23 @@ bool& LoggedUserRights() {
     return logged;
 }
 
-void NoteUserRights(DWORD shellPid, bool viaFallback, DWORD firstError) {
+void NoteUserRights(DWORD shellPid, bool viaFallback, DWORD firstError, bool privilegesEnabled) {
     if (LoggedUserRights()) {
         return;
     }
     LoggedUserRights() = true;
     if (viaFallback) {
-        Trace(L"  права пользователя: токен оболочки pid %lu; CreateProcessAsUser отказал (%s), "
-              L"запускаю через CreateProcessWithTokenW",
-              shellPid, Win32ErrorText(firstError).c_str());
+        // Откат чаще всего вызван именно 1314 (ERROR_PRIVILEGE_NOT_HELD): привилегии
+        // SeIncreaseQuota/SeAssignPrimaryToken есть только у повышенного процесса. Без этой
+        // пометки строка «CreateProcessAsUser отказал» читается как ошибка, хотя приложение
+        // запущено штатным запасным путём (CONTEXT п. 72 (е)).
+        Trace(L"  права пользователя: токен оболочки pid %lu; CreateProcessAsUser отказал (%s); "
+              L"%s; запускаю через CreateProcessWithTokenW",
+              shellPid, Win32ErrorText(firstError).c_str(),
+              privilegesEnabled
+                  ? L"привилегии SeIncreaseQuota/SeAssignPrimaryToken включены"
+                  : L"привилегии SeIncreaseQuota/SeAssignPrimaryToken включить не удалось "
+                    L"(обычно значит, что процесс не повышен)");
         return;
     }
     Trace(L"  права пользователя: токен оболочки pid %lu (не повышен), CreateProcessAsUser",
@@ -362,8 +375,10 @@ bool RunAsDesktopUser(LPCWSTR appName, wchar_t* command, DWORD consoleFlags,
         return false;
     }
 
-    EnablePrivilege(SE_INCREASE_QUOTA_NAME);
-    EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+    // Результат включения привилегий важен для журнала: по нему видно, почему
+    // CreateProcessAsUser отказал (1314 — привилегии есть только у повышенного процесса).
+    const bool quotaEnabled = EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+    const bool tokenEnabled = EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -394,7 +409,7 @@ bool RunAsDesktopUser(LPCWSTR appName, wchar_t* command, DWORD consoleFlags,
         }
         viaFallback = true;
     }
-    NoteUserRights(shell.pid, viaFallback, firstError);
+    NoteUserRights(shell.pid, viaFallback, firstError, quotaEnabled && tokenEnabled);
     if (pid != nullptr) {
         *pid = pi.dwProcessId;
     }
