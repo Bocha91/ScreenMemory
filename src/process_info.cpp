@@ -4,7 +4,9 @@
 #include <propvarutil.h>
 #include <shobjidl_core.h>
 
+#include <cstdio>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -44,9 +46,33 @@ NtQueryInformationProcessFn NtQueryInformationProcessPtr() {
     return fn;
 }
 
+std::wstring HexStatus(LONG status) {
+    wchar_t text[16] = {};
+    swprintf_s(text, L"0x%08lX", static_cast<unsigned long>(status));
+    return text;
+}
+
+// Окна защищённых и завершающихся процессов перечисляются в каждом цикле ожидания, а кэш
+// процессов между циклами сбрасывается (ClearProcessCache). Без этой памятки один и тот же
+// отказ попадал в лог десятки раз: «командная строка: NtQueryInformationProcess = 0xC0000225»
+// и «процесс N: OpenProcess: 5» повторялись на каждом перечислении окон — в живом журнале
+// это сотни одинаковых строк (CONTEXT п. 72). Пишем один раз на PID за прогон.
+std::set<DWORD>& ReportedProblems() {
+    static std::set<DWORD> pids;
+    return pids;
+}
+
+void NoteProcessProblem(DWORD pid, const std::wstring& text) {
+    if (!ReportedProblems().insert(pid).second) {
+        return;
+    }
+    sm::Trace(L"процесс %lu: %s (повторов по нему не будет)", static_cast<unsigned long>(pid),
+              text.c_str());
+}
+
 // Указатель CommandLine.Buffer ведёт внутрь того же буфера, который заполнил
 // ntdll, поэтому строку копируем сразу, до освобождения буфера.
-std::wstring ReadCommandLine(HANDLE process) {
+std::wstring ReadCommandLine(HANDLE process, DWORD pid) {
     const NtQueryInformationProcessFn query = NtQueryInformationProcessPtr();
     if (query == nullptr) {
         return std::wstring();
@@ -63,8 +89,8 @@ std::wstring ReadCommandLine(HANDLE process) {
                        static_cast<ULONG>(buffer.size()), &required);
     }
     if (status != 0 || buffer.size() < sizeof(ProcessCommandLine)) {
-        sm::Trace(L"командная строка: NtQueryInformationProcess = 0x%08lX",
-                  static_cast<unsigned long>(status));
+        NoteProcessProblem(pid, L"командная строка не прочитана: NtQueryInformationProcess = " +
+                                    HexStatus(status));
         return std::wstring();
     }
 
@@ -107,8 +133,7 @@ bool ReadProcessInfo(DWORD pid, ProcessInfo* out) {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (process == nullptr) {
         out->error = GetLastError();
-        Trace(L"процесс %lu: OpenProcess: %s", static_cast<unsigned long>(pid),
-              Win32ErrorText(out->error).c_str());
+        NoteProcessProblem(pid, L"OpenProcess: " + Win32ErrorText(out->error));
         return false;
     }
 
@@ -122,7 +147,7 @@ bool ReadProcessInfo(DWORD pid, ProcessInfo* out) {
     } else {
         out->error = GetLastError();
     }
-    out->cmdline = ReadCommandLine(process);
+    out->cmdline = ReadCommandLine(process, pid);
 
     CloseHandle(process);
     return !out->exePath.empty();

@@ -65,6 +65,11 @@ enum class LaunchRights {
 // «как пользователь» | «как вызвавший процесс» — для отчёта и --dry-run.
 const wchar_t* LaunchRightsText(LaunchRights rights);
 
+// Сколько ждать окно по записи слепка. Апплет панели управления (rundll32.exe,
+// control.exe — PLAN.md §9.4) показывает диалог сразу после старта либо не показывает
+// вовсе, поэтому для него предел урезан (CONTEXT п. 72); остальные записи получают defaultMs.
+int LaunchWaitMs(const LayoutWindow& saved, int defaultMs);
+
 // Запуск процесса по плану. pid — PID созданного процесса (0 у UWP, если
 // менеджер активации его не вернул); errorCode — код WinAPI/HRESULT.
 // rights == AsUser требует включённых привилегий администратора (SeIncreaseQuota /

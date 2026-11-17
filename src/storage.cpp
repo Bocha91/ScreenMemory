@@ -857,6 +857,21 @@ bool ParseLayout(const std::wstring& text, Layout* out, std::wstring* error) {
         }
     }
 
+    // Секции [window.N] раскладываются по номеру, поэтому дырка в нумерации (файл правили
+    // руками и секцию удалили) оставляла пустую запись: она уходила в фазу B строкой
+    // «не запускаем: команду запуска собрать не удалось», писала мусорную команду в
+    // admin.log и делала код возврата 1 (CONTEXT п. 72). У настоящей записи всегда есть
+    // чем опознать окно — путь к exe, AUMID, заголовок или класс, — так что пустые
+    // выбрасываем: индексы дальше пересчитываются сами, наружу они не выходят.
+    out->windows.erase(std::remove_if(out->windows.begin(), out->windows.end(),
+                                      [](const LayoutWindow& window) {
+                                          return window.exe.empty() && window.title.empty() &&
+                                                 window.cls.empty() && window.aumid.empty() &&
+                                                 window.cmdline.empty() && window.folder.empty() &&
+                                                 window.url.empty();
+                                      }),
+                       out->windows.end());
+
     if (!headerSeen) {
         if (error != nullptr) {
             *error = L"нет заголовка «# ScreenMemory layout v1»: файл не похож на раскладку";

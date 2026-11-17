@@ -1604,6 +1604,12 @@ int RunRestore(const CommandLine& cl) {
         HWND hwnd = nullptr;            // окно, найденное на шаге ожидания
         bool exited = false;            // процесс завершился, не показав окна
         std::vector<HWND> knownBefore;  // окна до старта: для пустых окон браузера
+        // Ожидание окна считается от момента запуска, а не от начала ожидания: приложения
+        // запускаются все сразу, и пока ждали предыдущие, это окно уже получило своё время
+        // (CONTEXT п. 72). waitMs — предел для этой записи (у апплетов панели управления он
+        // меньше, см. sm::LaunchWaitMs).
+        ULONGLONG launchedAt = 0;
+        int waitMs = 0;
     };
     std::vector<PendingLaunch> pending;
 
@@ -1777,6 +1783,8 @@ int RunRestore(const CommandLine& cl) {
         item.rect = rect;
         item.pid = pid;
         item.knownBefore = knownBeforeLaunch;
+        item.launchedAt = GetTickCount64();
+        item.waitMs = sm::LaunchWaitMs(saved, kLaunchTimeoutMs);
         pending.push_back(item);
         sm::Info(L"  запускаю: %-40s %s%s", FitText(saved.title, 40).c_str(),
                  sm::LaunchKindText(plan.kind),
@@ -1796,19 +1804,38 @@ int RunRestore(const CommandLine& cl) {
                 otherPids.push_back(other.pid);
             }
         }
-        sm::Info(L"  ждём окно: %-40s (до %d с)", FitText(saved.title, 40).c_str(),
-                 kLaunchTimeoutMs / 1000);
+        // Предел ожидания считается от запуска, а не от входа в этот цикл: приложения
+        // стартовали все сразу, и пока ждали окна предыдущих, это окно уже получило своё
+        // время. Иначе суммарное ожидание превращалось в N минут (CONTEXT п. 72).
+        const int elapsedMs = static_cast<int>(GetTickCount64() - item.launchedAt);
+        int budgetMs = item.waitMs - elapsedMs;
+        if (budgetMs < 0) {
+            budgetMs = 0;
+        }
+        if (budgetMs > 0) {
+            sm::Info(L"  ждём окно: %-40s (до %d с)", FitText(saved.title, 40).c_str(),
+                     (budgetMs + 999) / 1000);
+        } else {
+            sm::Info(L"  ждём окно: %-40s (время с запуска вышло — проверяю ещё раз)",
+                     FitText(saved.title, 40).c_str());
+        }
         HWND hwnd = nullptr;
         // Браузер ищем по адресу страницы: у Firefox окно создаёт уже работающий процесс,
         // а после прогрева на столе есть восстановленное окно сессии того же класса —
         // «новое окно класса» могло бы оказаться им (CONTEXT п. 63). Адрес не подтвердился
         // — обычный путь по процессу и классу.
         if (item.plan.kind == sm::LaunchKind::Browser && !saved.url.empty()) {
-            hwnd = sm::WaitForBrowserWindow(saved.cls, saved.url, knownWindows,
-                                            kBrowserWindowTimeoutMs);
+            const int searchMs =
+                budgetMs < kBrowserWindowTimeoutMs ? budgetMs : kBrowserWindowTimeoutMs;
+            hwnd = sm::WaitForBrowserWindow(saved.cls, saved.url, knownWindows, searchMs);
         }
         if (hwnd == nullptr) {
-            hwnd = sm::WaitForWindow(item.pid, saved, knownWindows, kLaunchTimeoutMs, &item.exited,
+            // Поиск по адресу съел часть предела: остаток считаем заново.
+            int leftMs = item.waitMs - static_cast<int>(GetTickCount64() - item.launchedAt);
+            if (leftMs < 0) {
+                leftMs = 0;  // одно последнее перечисление окон всё равно будет
+            }
+            hwnd = sm::WaitForWindow(item.pid, saved, knownWindows, leftMs, &item.exited,
                                      &otherPids);
         }
         if (hwnd == nullptr) {
@@ -1818,7 +1845,7 @@ int RunRestore(const CommandLine& cl) {
                 sm::AddAdminEntry(sm::AdminReason::LaunchFailed, sm::AdminCommand(saved));
             } else {
                 sm::Warn(L"«%s»: окно не появилось за %d с (процесс запущен)",
-                         saved.title.c_str(), kLaunchTimeoutMs / 1000);
+                         saved.title.c_str(), item.waitMs / 1000);
                 sm::AddAdminEntry(sm::AdminReason::LaunchTimeout, sm::AdminCommand(saved));
             }
             continue;

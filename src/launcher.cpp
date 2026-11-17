@@ -3,12 +3,14 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <tlhelp32.h>
 #include <userenv.h>
 
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "browser_url.h"
@@ -235,6 +237,7 @@ bool EnablePrivilege(const wchar_t* name) {
 struct ShellToken {
     HANDLE primary = nullptr;      // дубликат токена оболочки как primary-токен
     LPVOID environment = nullptr;  // окружение пользователя (CreateEnvironmentBlock)
+    DWORD pid = 0;                 // PID оболочки — для сообщения о способе понижения прав
 
     ~ShellToken() {
         if (environment != nullptr) {
@@ -298,6 +301,7 @@ bool OpenShellToken(ShellToken* out, std::wstring* error) {
                 }
                 out->primary = primary;
                 out->environment = environment;
+                out->pid = shellPid;
                 ok = true;
             } else {
                 CloseHandle(primary);
@@ -314,6 +318,31 @@ bool OpenShellToken(ShellToken* out, std::wstring* error) {
     }
     CloseHandle(process);
     return ok;
+}
+
+// Способ понижения прав одинаков для всех запусков одного restore, поэтому пишем о нём в
+// лог один раз, а не у каждого приложения: в отчёте у каждой строки уже стоит пометка
+// «(как пользователь)», а здесь важно другое — откуда взялся токен и каким вызовом он
+// применён (PLAN.md §9.3, CONTEXT п. 72). Без этой строки журнал не отвечал на вопрос
+// «чем именно понижены права» — видно было только, что запись запущена «как пользователь».
+bool& LoggedUserRights() {
+    static bool logged = false;
+    return logged;
+}
+
+void NoteUserRights(DWORD shellPid, bool viaFallback, DWORD firstError) {
+    if (LoggedUserRights()) {
+        return;
+    }
+    LoggedUserRights() = true;
+    if (viaFallback) {
+        Trace(L"  права пользователя: токен оболочки pid %lu; CreateProcessAsUser отказал (%s), "
+              L"запускаю через CreateProcessWithTokenW",
+              shellPid, Win32ErrorText(firstError).c_str());
+        return;
+    }
+    Trace(L"  права пользователя: токен оболочки pid %lu (не повышен), CreateProcessAsUser",
+          shellPid);
 }
 
 // Запуск с токеном оболочки: обычные права и окружение пользователя (PLAN.md §9.3).
@@ -344,24 +373,28 @@ bool RunAsDesktopUser(LPCWSTR appName, wchar_t* command, DWORD consoleFlags,
     const DWORD flags = CREATE_UNICODE_ENVIRONMENT | consoleFlags;
     LPCWSTR dir = workDir.empty() ? nullptr : workDir.c_str();
 
+    bool viaFallback = false;
+    DWORD firstError = 0;
     if (CreateProcessAsUserW(shell.primary, appName, command, nullptr, nullptr, FALSE, flags,
                              shell.environment, dir, &si, &pi) == FALSE) {
-        const DWORD first = GetLastError();
+        firstError = GetLastError();
         // Политика может запрещать SeIncreaseQuota/SeAssignPrimaryToken: тот же токен
         // через CreateProcessWithTokenW — ему достаточно SeImpersonatePrivilege.
         if (CreateProcessWithTokenW(shell.primary, 0, appName, command, flags, shell.environment,
                                     dir, &si, &pi) == FALSE) {
             const DWORD second = GetLastError();
             if (errorCode != nullptr) {
-                *errorCode = second != 0 ? second : first;
+                *errorCode = second != 0 ? second : firstError;
             }
             if (error != nullptr) {
-                *error = L"CreateProcessAsUser: " + Win32ErrorText(first) +
+                *error = L"CreateProcessAsUser: " + Win32ErrorText(firstError) +
                          L", CreateProcessWithToken: " + Win32ErrorText(second);
             }
             return false;
         }
+        viaFallback = true;
     }
+    NoteUserRights(shell.pid, viaFallback, firstError);
     if (pid != nullptr) {
         *pid = pi.dwProcessId;
     }
@@ -637,6 +670,97 @@ bool RunLaunch(const LaunchPlan& plan, LaunchRights rights, DWORD* pid, DWORD* e
 
 namespace {
 
+// Хост апплета панели управления: rundll32.exe (Shell32.dll,Control_RunDLL …) и control.exe
+// (PLAN.md §9.4). Их диалог — обычное owned-окно: владелец — скрытое окно того же процесса,
+// поэтому общий фильтр «owned-окно — панель или подсказка» такие окна отбрасывал, и запись
+// «Параметры экранной заставки» уходила в launch-timeout, хотя окно появлялось (CONTEXT п. 72).
+bool IsAppletHost(const std::wstring& exeName) {
+    return SameText(exeName, L"rundll32.exe") || SameText(exeName, L"control.exe");
+}
+
+// Предел ожидания окна апплета: диалог появляется сразу после старта либо не появляется
+// вовсе (второй экземпляр апплета просто выходит), поэтому 60 с ожидания бессмысленны.
+constexpr int kAppletWaitMs = 10000;
+
+bool InList(const std::vector<DWORD>* pids, DWORD pid) {
+    return pids != nullptr && std::find(pids->begin(), pids->end(), pid) != pids->end();
+}
+
+// PID процесса и всех его потомков: окно апплета может создать дочерний процесс
+// (rundll32 → control.exe, хост панели управления → dllhost.exe). Список пересобирается
+// на каждом опросе: нужный процесс появляется уже во время ожидания.
+std::vector<DWORD> ProcessFamily(DWORD root) {
+    std::vector<DWORD> pids;
+    if (root == 0) {
+        return pids;
+    }
+    pids.push_back(root);
+    std::vector<std::pair<DWORD, DWORD>> links;  // потомок → родитель
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return pids;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry) != FALSE) {
+        do {
+            links.emplace_back(entry.th32ProcessID, entry.th32ParentProcessID);
+        } while (Process32NextW(snapshot, &entry) != FALSE);
+    }
+    CloseHandle(snapshot);
+    // Транзитивное замыкание по связям «потомок → родитель»; каждый проход добавляет хотя
+    // бы один новый PID, поэтому цикл конечен.
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (const auto& link : links) {
+            if (std::find(pids.begin(), pids.end(), link.second) != pids.end() &&
+                std::find(pids.begin(), pids.end(), link.first) == pids.end()) {
+                pids.push_back(link.first);
+                grew = true;
+            }
+        }
+    }
+    return pids;
+}
+
+struct WindowDump {
+    DWORD pid = 0;
+    const std::vector<DWORD>* family = nullptr;
+    int count = 0;
+};
+
+BOOL CALLBACK DumpWindowProc(HWND hwnd, LPARAM param) {
+    WindowDump* dump = reinterpret_cast<WindowDump*>(param);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != dump->pid && !InList(dump->family, pid)) {
+        return TRUE;
+    }
+    wchar_t cls[256] = {};
+    GetClassNameW(hwnd, cls, static_cast<int>(_countof(cls)));
+    wchar_t title[512] = {};
+    GetWindowTextW(hwnd, title, static_cast<int>(_countof(title)));
+    Trace(L"  у процесса %lu окно %p: class=%s title=«%s»%s%s", static_cast<unsigned long>(pid),
+          static_cast<void*>(hwnd), cls, title,
+          IsWindowVisible(hwnd) != FALSE ? L"" : L" (невидимое)",
+          GetWindow(hwnd, GW_OWNER) != nullptr ? L" (owned)" : L"");
+    ++dump->count;
+    return TRUE;
+}
+
+// Что процесс успел создать: при таймауте это единственный способ понять, почему окно
+// «не появилось» — оно могло появиться с другим заголовком, быть owned или невидимым.
+void TraceProcessWindows(DWORD pid, const std::vector<DWORD>* family) {
+    WindowDump dump;
+    dump.pid = pid;
+    dump.family = family;
+    EnumWindows(DumpWindowProc, reinterpret_cast<LPARAM>(&dump));
+    if (dump.count == 0) {
+        Trace(L"  у процесса %lu окон нет — приложение не создало окно",
+              static_cast<unsigned long>(pid));
+    }
+}
+
 // Порог принятия окна: совпал PID (10), класс (5), заголовок (5) или «окно этого
 // класса появилось после запуска» (1).
 struct WaitContext {
@@ -649,6 +773,10 @@ struct WaitContext {
     // соседнего запуска забирать нельзя — две записи одного приложения поменялись бы
     // окнами (CONTEXT п. 70).
     const std::vector<DWORD>* otherPids = nullptr;
+    // Апплет панели управления: его диалог — owned-окно и может принадлежать дочернему
+    // процессу (family), поэтому фильтры для него мягче (CONTEXT п. 72).
+    bool applet = false;
+    const std::vector<DWORD>* family = nullptr;
     HWND found = nullptr;
     int score = 0;
 };
@@ -662,9 +790,6 @@ BOOL CALLBACK WaitProc(HWND hwnd, LPARAM param) {
     if (IsWindowVisible(hwnd) == FALSE) {
         return TRUE;
     }
-    if (GetWindow(hwnd, GW_OWNER) != nullptr) {
-        return TRUE;  // owned-окно: диалог, панель, подсказка
-    }
     if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
         return TRUE;
     }
@@ -674,13 +799,20 @@ BOOL CALLBACK WaitProc(HWND hwnd, LPARAM param) {
         return TRUE;
     }
     // Окно другого нашего запуска: не наше, что бы о нём ни говорили класс и свежесть.
-    if (ctx->otherPids != nullptr &&
-        std::find(ctx->otherPids->begin(), ctx->otherPids->end(), pid) != ctx->otherPids->end()) {
+    if (InList(ctx->otherPids, pid)) {
+        return TRUE;
+    }
+
+    const bool pidMatch = (ctx->pid != 0 && pid == ctx->pid) || InList(ctx->family, pid);
+    // Диалог апплета — owned-окно (владелец — скрытое окно того же процесса), а раньше
+    // такие окна отбрасывались безусловно — из-за этого «Параметры экранной заставки»
+    // уходили в launch-timeout, хотя окно было на экране (CONTEXT п. 72). Чужие
+    // owned-окна по-прежнему не трогаем: это панели и подсказки, не наши окна.
+    if (!pidMatch && GetWindow(hwnd, GW_OWNER) != nullptr) {
         return TRUE;
     }
 
     int score = 0;
-    const bool pidMatch = ctx->pid != 0 && pid == ctx->pid;
     if (pidMatch) {
         score += 10;
     }
@@ -717,6 +849,16 @@ BOOL CALLBACK WaitProc(HWND hwnd, LPARAM param) {
 
 }  // namespace
 
+int LaunchWaitMs(const LayoutWindow& saved, int defaultMs) {
+    // Апплет панели управления показывает диалог сразу после старта (или не показывает
+    // вовсе — второй экземпляр просто выходит): 60 с ожидания для него бессмысленны
+    // (CONTEXT п. 72).
+    if (IsAppletHost(FileNameOf(saved.exe))) {
+        return defaultMs < kAppletWaitMs ? defaultMs : kAppletWaitMs;
+    }
+    return defaultMs;
+}
+
 HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>& knownWindows,
                    int timeoutMs, bool* processExited, const std::vector<DWORD>* otherPids) {
     WaitContext ctx;
@@ -726,6 +868,13 @@ HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>
     ctx.title = saved.title;
     ctx.known = &knownWindows;
     ctx.otherPids = otherPids;
+
+    // Апплет панели управления: его диалог — owned-окно и может принадлежать дочернему
+    // процессу, поэтому окно ищем шире, чем для обычных приложений (CONTEXT п. 72).
+    std::vector<DWORD> family;
+    if (IsAppletHost(FileNameOf(saved.exe))) {
+        ctx.applet = true;
+    }
 
     if (processExited != nullptr) {
         *processExited = false;
@@ -738,6 +887,11 @@ HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>
     const ULONGLONG deadline = GetTickCount64() + wait;
     HWND found = nullptr;
     for (;;) {
+        if (ctx.applet) {
+            // Дочерний процесс апплета появляется уже во время ожидания: список берём заново.
+            family = ProcessFamily(pid);
+            ctx.family = &family;
+        }
         ctx.found = nullptr;
         ctx.score = 0;
         EnumWindows(WaitProc, reinterpret_cast<LPARAM>(&ctx));
@@ -758,6 +912,12 @@ HWND WaitForWindow(DWORD pid, const LayoutWindow& saved, const std::vector<HWND>
             break;
         }
         Sleep(250);
+    }
+    if (found == nullptr && pid != 0) {
+        // Таймаут: показываем, что процесс всё-таки создал. Без этого в журнале остаётся
+        // одно «окно не появилось», и причину (другой заголовок, owned-окно, невидимое
+        // окно) приходится выяснять вручную (CONTEXT п. 72).
+        TraceProcessWindows(pid, ctx.applet ? &family : nullptr);
     }
     if (process != nullptr) {
         CloseHandle(process);
@@ -1005,8 +1165,11 @@ bool IsExeRunning(const std::wstring& exePath) {
         if (pids[i] == 0 || pids[i] == selfPid) {
             continue;
         }
-        ProcessInfo info;
-        if (ReadProcessInfo(pids[i], &info) && SameText(info.exePath, exePath)) {
+        // Кэш процессов (ProcessInfoFor): IsExeRunning вызывается для каждой pinned-записи,
+        // а процессов в системе сотни — читать exe (и командную строку) заново на каждую
+        // запись незачем.
+        const ProcessInfo& info = ProcessInfoFor(pids[i]);
+        if (!info.exePath.empty() && SameText(info.exePath, exePath)) {
             return true;
         }
     }
